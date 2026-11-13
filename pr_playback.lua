@@ -2,7 +2,8 @@
 -- pr_playback.lua — Stateless Transport, Scheduler, Loop & MIDI Output Protocol
 -- ============================================================================
 
-local Model = require("pr_model")
+local Model  = require("pr_model")
+local Layout = require("pr_layout")
 
 local Playback = {}
 
@@ -269,6 +270,48 @@ function Playback.sync_note_modified(self, note)
   end
 end
 
+function Playback.follow_view(self, force_snap)
+  if self.follow_playhead == false then return false end
+  local dm = self.drag_mode
+  if dm == "hscroll" or dm == "pan" or dm == "hzoom_grip" or dm == "shift_zoom" then
+    return false
+  end
+
+  local layout = Layout.compute(self)
+  local roll = layout.roll
+  local ppb = self.px_per_beat or Layout.DEF_PPB
+  if roll.w <= 1 or ppb <= 0 then return false end
+
+  local h_vis = roll.w / ppb
+  local base_total = max(self.length_beats or 16, self.max_end_beat or 0, 4.0)
+  local max_vb = max(0.0, base_total - h_vis)
+  local ph = max(0.0, self.playhead_beat or 0.0)
+  local vb = self.view_beat or 0.0
+
+  local right_limit = vb + h_vis * (force_snap and 0.90 or 0.92)
+  local left_limit  = (vb > 1e-4) and (vb + h_vis * 0.02) or -1.0
+
+  local need_right = (ph >= right_limit) and (vb < max_vb - 1e-4)
+  local need_left  = (ph < left_limit)
+
+  if not (need_right or need_left) then
+    return false
+  end
+
+  local target_vb = max(0.0, min(max_vb, ph - h_vis * 0.10))
+  if math.abs(target_vb - vb) <= 1e-4 then
+    return false
+  end
+
+  self._pan_extra_beats = 0.0
+  self.view_beat = target_vb
+  Layout.clamp_view(self, layout)
+  self._dirty_l1 = true
+  self._dirty_l2 = true
+  self._dirty_l3 = true
+  return true
+end
+
 function Playback.start(self)
   if self.playing then return end
   if self.events_dirty then Model.rebuild_events(self) end
@@ -289,6 +332,8 @@ function Playback.start(self)
 
   self.playing      = true
   self.last_systime = pd.systime()
+
+  Playback.follow_view(self, true)
 
   self:outlet(3, "playing", { 1 })
   Playback.emit_pos(self)
@@ -376,6 +421,9 @@ function Playback.seek_beat(self, beat)
 
   self._dirty_l2 = true
   self._dirty_l3 = true
+  if self.playing and self.drag_mode ~= "ruler" and self.drag_mode ~= "loop" then
+    Playback.follow_view(self, true)
+  end
   self:flush_repaint()
 end
 
@@ -436,6 +484,7 @@ function Playback.on_tick(self)
 
   self.playhead_beat = new_beat
   Playback.emit_pos(self)
+  Playback.follow_view(self, false)
 
   if list_changed then
     Playback.emit_active_list(self)

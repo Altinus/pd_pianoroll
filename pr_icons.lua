@@ -169,6 +169,14 @@ local function build_body(name, c, a)
       '<path d="M5.9,5.8 V9.6 M8.1,5.8 V9.6" fill="none" stroke="%s" stroke-opacity="%s" stroke-width="1.15" stroke-linecap="round"/>',
       c, a, c, a, c, a
     )
+  elseif name == "follow" then
+    -- Playhead stem + cap triangle with chasing forward arrow
+    return string.format(
+      '<line x1="10.2" y1="3.4" x2="10.2" y2="12.0" stroke="%s" stroke-opacity="%s" stroke-width="1.35" stroke-linecap="round"/>' ..
+      '<path d="M8.1,2.0 L12.3,2.0 L10.2,4.4 Z" fill="%s" fill-opacity="%s"/>' ..
+      '<path d="M2.0,7.8 H7.2 M5.4,5.7 L7.6,7.8 L5.4,9.9" fill="none" stroke="%s" stroke-opacity="%s" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>',
+      c, a, c, a, c, a
+    )
   elseif name == "reset" then
     -- Circular view reset arrow around center anchor dot
     return string.format(

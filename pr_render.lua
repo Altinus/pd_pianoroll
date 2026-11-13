@@ -9,6 +9,7 @@ local Theme  = require("pr_theme")
 local Layout = require("pr_layout")
 local Model  = require("pr_model")
 local Icons  = require("pr_icons")
+local Midi   = require("pr_midi")
 
 local Render = {}
 
@@ -115,9 +116,12 @@ local function draw_toolbar(self, g, layout, pal)
     draw_icon_pill(btns.stop, false, nil, "stop", pal.toolbar_text, 0.92)
   end
 
-  -- Loop button
+  -- Loop & Follow Playhead buttons
   if btns.loop then
     draw_icon_pill(btns.loop, self.loop_enabled, pal.loop_fill, "loop")
+  end
+  if btns.follow then
+    draw_icon_pill(btns.follow, (self.follow_playhead ~= false), pal.note_fill, "follow", pal.toolbar_muted)
   end
 
   -- BPM widget: [-] [BPM] [+] (numeric value stays crisp text)
@@ -196,6 +200,13 @@ local function draw_toolbar(self, g, layout, pal)
   end
   if btns.clr then
     draw_icon_pill(btns.clr, false, nil, "clr")
+  end
+
+  -- Multi-track MIDI switcher pill (auto-appears when a multi-track .mid is imported)
+  if btns.midi_track then
+    local lbl = Midi.get_track_pill_label(self) or "ALL"
+    local is_single = (self.midi_track_idx or 0) > 0
+    draw_pill(btns.midi_track, true, is_single and pal.note_fill or pal.loop_fill, lbl)
   end
 
   -- Status info text
@@ -1036,6 +1047,8 @@ function Render.get_hover_tooltip(self, layout)
       return "Stop & Rewind Playhead", tr
     elseif b == "loop" then
       return "Loop Region: " .. (self.loop_enabled and "ON" or "OFF") .. " (Ruler: Ctrl+Drag / DblClick)", tr
+    elseif b == "follow" then
+      return "Follow Playhead: " .. ((self.follow_playhead ~= false) and "ON (Auto-Scroll)" or "OFF"), tr
     elseif b == "bpm_minus" then
       return "Decrease BPM (-1, Shift: -0.1)", tr
     elseif b == "bpm_val" then
@@ -1080,6 +1093,8 @@ function Render.get_hover_tooltip(self, layout)
       return "Fit All Notes in View", tr
     elseif b == "clr" then
       return "Clear All Notes (Undoable)", tr
+    elseif b == "midi_track" then
+      return Midi.describe_active_track(self), tr
     elseif b == "mod_ctrl" then
       return "Ctrl Lock: Box Select / Ruler Loop Select", tr
     elseif b == "mod_shift" then

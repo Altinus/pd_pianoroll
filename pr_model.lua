@@ -294,7 +294,7 @@ function Model.recompute_max_end(self)
   return max_end
 end
 
-function Model.add_note(self, pitch, start_beat, length, velocity)
+function Model.add_note(self, pitch, start_beat, length, velocity, channel, track)
   pitch      = max(0, min(127, floor((tonumber(pitch) or 60) + 0.5)))
   start_beat = max(0.0, tonumber(start_beat) or 0.0)
   length     = max(0.03125, tonumber(length) or Model.get_default_note_length(self))
@@ -306,6 +306,8 @@ function Model.add_note(self, pitch, start_beat, length, velocity)
     start_beat = start_beat,
     length     = length,
     velocity   = velocity,
+    channel    = channel,
+    track      = track,
   }
   self.next_id = self.next_id + 1
   local notes = self.notes
@@ -561,6 +563,24 @@ local function clone_notes_list(notes)
       length     = n.length,
       velocity   = n.velocity,
       id         = n.id,
+      channel    = n.channel,
+      track      = n.track,
+    }
+  end
+  return out
+end
+
+local function clone_midi_tracks(tracks)
+  if not tracks then return nil end
+  local out = {}
+  for i = 1, #tracks do
+    local t = tracks[i]
+    out[i] = {
+      raw_idx    = t.raw_idx,
+      ordinal    = t.ordinal,
+      name       = t.name,
+      notes      = clone_notes_list(t.notes),
+      note_count = t.note_count,
     }
   end
   return out
@@ -581,11 +601,14 @@ function Model.capture_snapshot(self)
     selected_ids   = clone_sel_set(self.selected_ids),
     primary_sel_id = self.primary_sel_id,
     last_note_len  = self.last_note_len,
+    midi_tracks    = clone_midi_tracks(self.midi_tracks),
+    midi_track_idx = self.midi_track_idx or 0,
   }
 end
 
 function Model.snapshots_equal(a, b)
   if not a or not b then return false end
+  if (a.midi_track_idx or 0) ~= (b.midi_track_idx or 0) then return false end
   local na, nb = a.notes, b.notes
   if #na ~= #nb then return false end
   for i = 1, #na do
@@ -605,6 +628,8 @@ local function restore_snapshot(self, snap)
   self.notes          = clone_notes_list(snap.notes)
   self.selected_ids   = clone_sel_set(snap.selected_ids)
   self.primary_sel_id = snap.primary_sel_id
+  self.midi_tracks    = clone_midi_tracks(snap.midi_tracks)
+  self.midi_track_idx = snap.midi_track_idx or 0
   if snap.last_note_len and snap.last_note_len > 0 then
     self.last_note_len = snap.last_note_len
   end

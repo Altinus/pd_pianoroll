@@ -23,6 +23,7 @@ if type(dir) == "string" and dir ~= "" then
 end
 local Layout = require("pr_layout")
 local Model  = require("pr_model")
+local Midi   = require("pr_midi")
 package.path = saved_pp
 
 local function find_outlets(outlet_num, sel_filter)
@@ -1043,16 +1044,283 @@ obj:prop_grid_contrast(1.1)
 harness.assert_near(obj.bpm, 128, 0.001, "prop_bpm updated bpm")
 obj:prop_show_tooltips(0)
 obj:prop_shift_drag_dup(0)
+obj:prop_follow_playhead(0)
 obj:save_state()
 local fn_get_args = obj.get_args
 if type(fn_get_args) == "function" then
   local saved_args = fn_get_args(obj)
-  assert(saved_args and saved_args[52] == -2 and saved_args[57] == -3 and saved_args[59] == -4 and #saved_args > 61,
-         "save_state persisted v2/v3/v4 headers + notes in args")
+  assert(saved_args and saved_args[52] == -2 and saved_args[57] == -3 and saved_args[59] == -4
+         and saved_args[62] == -5 and #saved_args > 63,
+         "save_state persisted v2/v3/v4/v5 headers + notes in args")
   harness.assert_eq(saved_args[60], 0, "show_tooltips=false persisted under -4 header")
   harness.assert_eq(saved_args[61], 0, "shift_drag_dup=false persisted under -4 header")
+  harness.assert_eq(saved_args[63], 0, "follow_playhead=false persisted under -5 header")
 end
 obj:prop_show_tooltips(1)
 obj:prop_shift_drag_dup(1)
+obj:prop_follow_playhead(1)
+
+-- ----------------------------------------------------------------------------
+-- Test 21: Follow Playhead auto-scroll, loop wrap snap & toolbar/inlet toggles
+-- ----------------------------------------------------------------------------
+;(function()
+  send_msg(1, "stop")
+  send_msg(1, "clear_loop")
+  send_msg(1, "length", 32)
+  send_msg(1, "bpm", 120)
+  send_msg(1, "follow", 1)
+  send_msg(3, "hzoom", 160) -- ~4.1 beats visible on default 720w object
+  send_msg(3, "scroll", 0.0, 78)
+  send_msg(1, "seek", 0.0)
+
+  local lay21 = Layout.compute(obj)
+  local bf = lay21.btns and lay21.btns.follow
+  assert(bf ~= nil and bf.w > 10, "toolbar follow button geometry present")
+  local h_vis = lay21.roll.w / (obj.px_per_beat or 160)
+
+  -- Start playback: before 92% of viewport, view stays at 0.0
+  send_msg(1, "play")
+  harness.advance(1000) -- ~2.0 beats at 120 BPM
+  harness.assert_near(obj.view_beat, 0.0, 0.01, "follow keeps view_beat=0 while playhead inside viewport")
+
+  -- Cross 92% threshold (~3.8 beats): page turns smoothly forward
+  harness.advance(1100) -- ~4.2 beats
+  assert(obj.view_beat > 1.5, "follow turned page forward after crossing 92% of viewport width")
+  assert(obj.playhead_beat >= obj.view_beat and obj.playhead_beat < obj.view_beat + h_vis * 0.6,
+         "after follow page turn, playhead stays visible on left side")
+
+  -- Loop wrap backward snap: playhead wrapping back to 1.0 pulls view back left
+  send_msg(1, "loop", 1, 1.0, 4.8)
+  harness.advance(450) -- ~4.2 + 0.9 = 5.1 -> wraps to ~1.3 (< current view_beat)
+  assert(obj.view_beat <= obj.playhead_beat + 0.01 and obj.playhead_beat < obj.view_beat + h_vis,
+         "follow snapped view left when loop wrapped behind viewport")
+
+  -- Disable follow via toolbar button click -> playback no longer scrolls view
+  click(bf.x + bf.w * 0.5, bf.y + bf.h * 0.5)
+  assert(obj.follow_playhead == false, "toolbar click toggled follow_playhead OFF")
+  send_msg(1, "clear_loop")
+  send_msg(3, "scroll", 0.0, 78)
+  send_msg(1, "seek", 3.5)
+  harness.advance(1000) -- playhead reaches ~5.5 (offscreen right)
+  assert(obj.playhead_beat > 4.5, "playhead advanced offscreen right with follow OFF")
+  harness.assert_near(obj.view_beat, 0.0, 0.01, "follow OFF did not auto-scroll view")
+
+  -- Re-enable via Inlet 1 while playing -> immediate snap to offscreen playhead
+  send_msg(1, "follow", 1)
+  assert(obj.follow_playhead == true, "inlet follow 1 enabled follow_playhead")
+  assert(obj.view_beat > 2.5 and obj.playhead_beat >= obj.view_beat and obj.playhead_beat < obj.view_beat + h_vis,
+         "enabling follow during playback immediately snapped view to playhead")
+
+  send_msg(1, "stop")
+  send_msg(1, "length", 16)
+  send_msg(1, "reset_view")
+end)()
+
+-- ----------------------------------------------------------------------------
+-- Test 22: Standard MIDI File (.mid) Export, Overwrite Import, BPM/Length Sync & Undo
+-- ----------------------------------------------------------------------------
+;(function()
+  local function remove_test_file(p)
+    local has_f, ffi_lib = pcall(require, "ffi")
+    if has_f and ffi_lib and ffi_lib.os == "Windows" then
+      local ok_k, k32 = pcall(ffi_lib.load, "kernel32")
+      pcall(ffi_lib.cdef, [[
+        int DeleteFileW(const uint16_t* lpFileName);
+      ]])
+      if ok_k and k32 then
+        local wlen = k32.MultiByteToWideChar(65001, 0, p, -1, nil, 0)
+        if wlen > 0 then
+          local wbuf = ffi_lib.new("uint16_t[?]", wlen)
+          if k32.MultiByteToWideChar(65001, 0, p, -1, wbuf, wlen) > 0 then
+            k32.DeleteFileW(wbuf)
+          end
+        end
+      end
+    end
+    os.remove(p)
+  end
+
+  local tmp_base = (type(dir) == "string" and dir ~= "" and dir) or "pianoroll"
+  local midi_path = tmp_base .. "/_tmp_测试_export.mid"
+  remove_test_file(midi_path)
+
+  send_msg(1, "clear")
+  send_msg(1, "bpm", 136.5)
+  send_msg(1, "timesig", 3)
+  send_msg(1, "add", 60, 0.0, 1.0, 96)
+  send_msg(1, "add", 64, 1.5, 0.75, 88)
+  send_msg(1, "add", 67, 9.0, 2.0, 112) -- ends at 11.0 -> 4 bars of 3/4 = 12 beats
+
+  harness.clear_outlets()
+  send_msg(1, "export_midi", midi_path)
+  local exp_msg = last_outlet(4, "exported")
+  assert(exp_msg and exp_msg.atoms[2] == 3, "export_midi emitted exported count=3")
+  local raw_bytes = Midi.read_bytes(midi_path)
+  assert(raw_bytes and raw_bytes:sub(1, 4) == "MThd", "exported .mid starts with MThd header")
+
+  -- Overwrite state cleanly before testing import
+  send_msg(1, "bpm", 92.0)
+  send_msg(1, "timesig", 4)
+  send_msg(1, "length", 8)
+  send_msg(1, "set_notes", 48, 0.0, 1.0, 80)
+  harness.assert_eq(#obj.notes, 1, "pre-import dummy note ready")
+
+  harness.clear_outlets()
+  send_msg(1, "import_midi", midi_path)
+  local imp_msg = last_outlet(4, "imported")
+  assert(imp_msg and imp_msg.atoms[2] == 3, "import_midi emitted imported count=3")
+  harness.assert_eq(#obj.notes, 3, "import_midi overwrote notes instead of appending")
+  harness.assert_near(obj.bpm, 136.5, 0.05, "import_midi synced BPM from MIDI tempo")
+  harness.assert_eq(obj.timesig_num, 3, "import_midi synced time signature numerator")
+  harness.assert_near(obj.length_beats, 12.0, 0.01, "import_midi synced bar-aligned length_beats")
+  harness.assert_eq(obj.notes[1].pitch, 60, "imported note 1 pitch exact")
+  harness.assert_near(obj.notes[2].start_beat, 1.5, 0.01, "imported note 2 beat exact")
+  harness.assert_near(obj.notes[3].length, 2.0, 0.01, "imported note 3 length exact")
+  harness.assert_eq(obj.notes[3].velocity, 112, "imported note 3 velocity exact")
+
+  -- Undo restores pre-import notes cleanly
+  send_msg(1, "undo")
+  harness.assert_eq(#obj.notes, 1, "undo after import_midi restored dummy note")
+  harness.assert_eq(obj.notes[1].pitch, 48, "undo restored dummy note pitch")
+  send_msg(1, "redo")
+  harness.assert_eq(#obj.notes, 3, "redo restored imported MIDI notes")
+
+  remove_test_file(midi_path)
+end)()
+
+-- ----------------------------------------------------------------------------
+-- Test 23: Multi-Track SMF Type 1 Import, On-Canvas Track Switcher & Explicit Filter
+-- ----------------------------------------------------------------------------
+;(function()
+  local function be_u16(v)
+    return string.char(math.floor(v / 256) % 256, v % 256)
+  end
+  local function be_u32(v)
+    return string.char(
+      math.floor(v / 16777216) % 256,
+      math.floor(v / 65536) % 256,
+      math.floor(v / 256) % 256,
+      v % 256
+    )
+  end
+  local function mtrk(body)
+    return "MTrk" .. be_u32(#body) .. body
+  end
+  local function vlq(n)
+    if n < 128 then return string.char(n) end
+    local lo = n % 128
+    local hi = math.floor(n / 128)
+    return string.char(128 + hi, lo)
+  end
+
+  local tmp_base = (type(dir) == "string" and dir ~= "" and dir) or "pianoroll"
+  local multi_path = tmp_base .. "/_tmp_multitrack_type1.mid"
+  local multi_rt_path = tmp_base .. "/_tmp_multitrack_roundtrip.mid"
+  os.remove(multi_path)
+  os.remove(multi_rt_path)
+
+  -- Construct SMF Type 1 (ppq=480):
+  -- MTrk 1: Conductor/Meta-only (0 notes, 148 BPM, 4/4)
+  -- MTrk 2: "Lead" (2 notes: pitch 76, 79)
+  -- MTrk 3: "Bass" (3 notes: pitch 36, 40, 43 ending at beat 7.5 -> 2 bars = 8 beats)
+  local us148 = math.floor(60000000 / 148 + 0.5)
+  local trk1 = mtrk(
+    string.char(0x00, 0xFF, 0x51, 0x03,
+                math.floor(us148 / 65536) % 256, math.floor(us148 / 256) % 256, us148 % 256) ..
+    string.char(0x00, 0xFF, 0x58, 0x04, 4, 2, 24, 8) ..
+    string.char(0x00, 0xFF, 0x2F, 0x00)
+  )
+  local trk2 = mtrk(
+    string.char(0x00, 0xFF, 0x03, 4) .. "Lead" ..
+    string.char(0x00, 0x90, 76, 100) .. vlq(480) .. string.char(0x80, 76, 0) ..
+    string.char(0x00, 0x90, 79, 105) .. vlq(480) .. string.char(0x80, 79, 0) ..
+    string.char(0x00, 0xFF, 0x2F, 0x00)
+  )
+  local trk3 = mtrk(
+    string.char(0x00, 0xFF, 0x03, 4) .. "Bass" ..
+    string.char(0x00, 0x91, 36, 95) .. vlq(960) .. string.char(0x81, 36, 0) ..
+    string.char(0x00, 0x91, 40, 92) .. vlq(960) .. string.char(0x81, 40, 0) ..
+    vlq(720) .. string.char(0x91, 43, 98) .. vlq(960) .. string.char(0x81, 43, 0) .. -- beat 5.5..7.5
+    string.char(0x00, 0xFF, 0x2F, 0x00)
+  )
+  local smf = "MThd" .. be_u32(6) .. be_u16(1) .. be_u16(3) .. be_u16(480) .. trk1 .. trk2 .. trk3
+  local ok_w = Midi.write_bytes(multi_path, smf)
+  assert(ok_w, "wrote temporary multi-track Type 1 fixture")
+
+  -- A) Import without [track] -> defaults to ALL notes + shows toolbar track switcher
+  send_msg(1, "import_midi", multi_path)
+  harness.assert_eq(#obj.notes, 5, "multi-track import defaults to ALL tracks merged (5 notes)")
+  harness.assert_near(obj.bpm, 148.0, 0.2, "multi-track import synced BPM ~148")
+  harness.assert_near(obj.length_beats, 8.0, 0.01, "multi-track import synced length=8 beats")
+  assert(obj.midi_tracks and #obj.midi_tracks == 2, "kept 2 non-empty MIDI tracks for switching")
+  harness.assert_eq(obj.midi_track_idx, 0, "default midi_track_idx == 0 (ALL)")
+  assert(Midi.get_track_pill_label(obj) == "ALL", "track pill defaults to ALL")
+
+  local lay23 = Layout.compute(obj)
+  local mtb = lay23.btns and lay23.btns.midi_track
+  assert(mtb ~= nil and mtb.w > 20, "toolbar displays midi_track switcher pill when multi-track loaded")
+
+  -- Click track pill -> switches to first note track (MTrk 2 Lead)
+  click(mtb.x + mtb.w * 0.5, mtb.y + mtb.h * 0.5)
+  harness.assert_eq(obj.midi_track_idx, 1, "first pill click switched to track slot 1 (MTrk 2)")
+  assert(Midi.get_track_pill_label(obj) == "T2", "track pill shows T2")
+  harness.assert_eq(#obj.notes, 2, "Lead track has 2 notes")
+  harness.assert_eq(obj.notes[1].pitch, 76, "Lead note 1 pitch == 76")
+
+  -- Edit Lead while isolated, then switch to Bass (MTrk 3) & back to ALL
+  send_msg(1, "add", 84, 2.0, 0.5, 110)
+  harness.assert_eq(#obj.notes, 3, "added note while isolated in Lead track")
+
+  click(mtb.x + mtb.w * 0.5, mtb.y + mtb.h * 0.5)
+  harness.assert_eq(obj.midi_track_idx, 2, "second pill click switched to track slot 2 (MTrk 3)")
+  assert(Midi.get_track_pill_label(obj) == "T3", "track pill shows T3")
+  harness.assert_eq(#obj.notes, 3, "Bass track has 3 notes")
+  harness.assert_eq(obj.notes[1].pitch, 36, "Bass note 1 pitch == 36")
+
+  send_msg(1, "midi_track", "all")
+  harness.assert_eq(obj.midi_track_idx, 0, "midi_track all returned to ALL view")
+  harness.assert_eq(#obj.notes, 6, "ALL view preserved edits made while isolated in Lead (6 notes)")
+
+  -- Export Type 1 multi-track and re-decode roundtrip
+  send_msg(1, "export_midi", multi_rt_path)
+  local rt_bytes = Midi.read_bytes(multi_rt_path)
+  local rt_dec = rt_bytes and Midi.decode(rt_bytes) or nil
+  assert(rt_dec and rt_dec.format == 1 and #rt_dec.note_tracks == 2 and #rt_dec.all_notes == 6,
+         "multi-track Type 1 roundtrip preserved 2 tracks and 6 notes")
+
+  -- B) Explicit [track] import filters strictly to specified track (and removes switcher)
+  send_msg(1, "import_midi", multi_path, 3)
+  harness.assert_eq(#obj.notes, 3, "explicit import_midi <path> 3 imported only Bass (3 notes)")
+  harness.assert_eq(obj.notes[1].pitch, 36, "explicit track 3 note 1 pitch == 36")
+  assert(obj.midi_tracks == nil, "explicit single-track import leaves track switcher hidden")
+  local lay23b = Layout.compute(obj)
+  assert(lay23b.btns.midi_track == nil, "toolbar track switcher hidden after explicit single-track import")
+
+  -- C) Invalid track index fails cleanly without wiping current notes
+  local ok99, err99 = Midi.import_from_file(obj, multi_path, 99)
+  assert((not ok99) and type(err99) == "string", "invalid explicit track index returned error")
+  harness.assert_eq(#obj.notes, 3, "invalid explicit track index did not wipe current notes")
+
+  os.remove(multi_path)
+  os.remove(multi_rt_path)
+
+  -- Restore clean preview chord fixture for --paint preview.svg
+  send_msg(1, "bpm", 128)
+  send_msg(1, "timesig", 4)
+  send_msg(1, "length", 16)
+  local unpack_fn = table.unpack or rawget(_G, "unpack")
+  local preview_notes = {
+    48, 0.0, 2.0, 95,  55, 0.0, 2.0, 88,  60, 0.0, 1.0, 100, 63, 0.0, 1.5, 92,
+    67, 0.5, 1.0, 108, 70, 1.0, 1.0, 112, 74, 1.5, 0.5, 118,
+    56, 2.0, 1.0, 96,  60, 2.0, 1.0, 90,  63, 2.0, 1.0, 94,  67, 2.5, 0.5, 110,
+    55, 3.0, 1.0, 98,  59, 3.0, 1.0, 92,  62, 3.0, 0.75, 102, 65, 3.25, 0.75, 114
+  }
+  harness.send(1, "set_notes", preview_notes)
+  local _ = unpack_fn
+  send_msg(1, "fit")
+  send_msg(1, "seek", 1.25)
+  Model.select_only(obj, obj.notes[7].id)
+  obj.hud_text = "Default Zoom & Pos"
+end)()
 
 pd.post("[TEST PASSED] All pianoroll DAW interaction, protocol & layout assertions succeeded.")

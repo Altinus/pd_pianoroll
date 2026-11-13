@@ -5,6 +5,7 @@
 local Layout   = require("pr_layout")
 local Model    = require("pr_model")
 local Playback = require("pr_playback")
+local Midi     = require("pr_midi")
 
 local Input = {}
 
@@ -368,6 +369,16 @@ local function handle_toolbar_down(self, layout, x, y)
     mark_all_dirty(self)
     self:flush_repaint()
     return true
+  elseif Layout.in_rect(x, y, btns.follow) then
+    self.follow_playhead = (self.follow_playhead == false)
+    if self.follow_playhead and self.playing then
+      Playback.follow_view(self, true)
+    end
+    self.hud_text = "Follow Playhead: " .. (self.follow_playhead and "ON" or "OFF")
+    self:save_state()
+    mark_all_dirty(self)
+    self:flush_repaint()
+    return true
   elseif Layout.in_rect(x, y, btns.bpm_minus) then
     local step = is_shift(self) and 0.1 or 1.0
     Playback.set_bpm(self, (self.bpm or 120) - step)
@@ -458,6 +469,7 @@ local function handle_toolbar_down(self, layout, x, y)
     if #self.notes > 0 then
       Model.push_undo(self)
     end
+    Midi.clear_tracks(self)
     Model.clear_notes(self)
     self._ctrl_selected = false
     if self.playing then Playback.emit_active_list(self) end
@@ -465,6 +477,9 @@ local function handle_toolbar_down(self, layout, x, y)
     self:save_state()
     mark_all_dirty(self)
     self:flush_repaint()
+    return true
+  elseif Layout.in_rect(x, y, btns.midi_track) then
+    Midi.switch_track(self, is_shift(self) and "prev" or "next")
     return true
   elseif Layout.in_rect(x, y, btns.mod_ctrl) then
     -- Fallback sticky toggle / stuck-modifier release

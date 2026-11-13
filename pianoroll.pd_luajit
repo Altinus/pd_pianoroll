@@ -39,6 +39,7 @@ local Theme    = require("pr_theme")
 local Layout   = require("pr_layout")
 local Model    = require("pr_model")
 local Playback = require("pr_playback")
+local Midi     = require("pr_midi")
 local Render   = require("pr_render")
 local Input    = require("pr_input")
 
@@ -142,6 +143,8 @@ function M:save_state()
     -4, -- v4 extension header sentinel (preserves v1, v2 & v3 patch loading)
     (self.show_tooltips ~= false) and 1 or 0,
     (self.shift_drag_dup ~= false) and 1 or 0,
+    -5, -- v5 extension header sentinel (preserves v1..v4 patch loading)
+    (self.follow_playhead ~= false) and 1 or 0,
   }
 
   local note_atoms = Model.serialize_notes(self)
@@ -251,6 +254,8 @@ function M:initialize(sel, atoms)
   self.events           = {}
   self.events_dirty     = true
   self.event_cursor     = 1
+  self.midi_tracks      = nil
+  self.midi_track_idx   = 0
 
   self.keys_down        = {}
   self.drag_mode        = nil
@@ -263,6 +268,7 @@ function M:initialize(sel, atoms)
   self.single_key_hotkeys = true
   self.show_tooltips      = true
   self.shift_drag_dup     = true
+  self.follow_playhead    = true
   self._mouse_inside      = false
   self._pan_extra_beats   = 0.0
   self.undo_stack         = {}
@@ -277,7 +283,7 @@ function M:initialize(sel, atoms)
     init_w                = clamp(floor(num_or(atoms[1], Layout.DEF_W) + 0.5), 160, 2400)
     init_h                = clamp(floor(num_or(atoms[2], Layout.DEF_H) + 0.5), 120, 1600)
     self.bpm              = clamp(num_or(atoms[3], 120.0), 20.0, 300.0)
-    self.length_beats     = clamp(num_or(atoms[4], 16.0), 1.0, 512.0)
+    self.length_beats     = clamp(num_or(atoms[4], 16.0), 1.0, 2048.0)
     self.timesig_num      = clamp(floor(num_or(atoms[5], 4) + 0.5), 1, 16)
     self.grid_div_idx     = clamp(floor(num_or(atoms[6], 5) + 0.5), 1, #Model.GRID_DIVS)
     self.snap_enabled     = (num_or(atoms[7], 1) ~= 0)
@@ -335,6 +341,10 @@ function M:initialize(sel, atoms)
           self.shift_drag_dup = (num_or(atoms[note_start + 2], 1) ~= 0)
           note_start = note_start + 3
         end
+        if n_atoms >= note_start + 1 and num_or(atoms[note_start], 0) == -5 then
+          self.follow_playhead = (num_or(atoms[note_start + 1], 1) ~= 0)
+          note_start = note_start + 2
+        end
       end
     end
 
@@ -360,7 +370,7 @@ function M:initialize(sel, atoms)
       self.bpm = clamp(atoms[3], 20.0, 300.0)
     end
     if n_atoms >= 4 and type(atoms[4]) == "number" then
-      self.length_beats = clamp(atoms[4], 1.0, 512.0)
+      self.length_beats = clamp(atoms[4], 1.0, 2048.0)
     end
     if n_atoms >= 5 and type(atoms[5]) == "number" then
       self.timesig_num = clamp(floor(atoms[5] + 0.5), 1, 16)
@@ -456,9 +466,12 @@ function M:prereload()
     single_key_hotkeys = self.single_key_hotkeys,
     show_tooltips = self.show_tooltips,
     shift_drag_dup = self.shift_drag_dup,
+    follow_playhead = self.follow_playhead,
     _pan_extra_beats = self._pan_extra_beats,
     undo_stack = self.undo_stack,
     redo_stack = self.redo_stack,
+    midi_tracks = self.midi_tracks,
+    midi_track_idx = self.midi_track_idx,
   }
 end
 
@@ -721,7 +734,7 @@ function M:in_1(sel, atoms)
     end
     return
   elseif sel == "length" then
-    self.length_beats = clamp(num_or(atoms[1], 16.0), 1.0, 512.0)
+    self.length_beats = clamp(num_or(atoms[1], 16.0), 1.0, 2048.0)
     Layout.clamp_view(self)
     self:save_state()
     self._dirty_l1 = true
@@ -731,7 +744,7 @@ function M:in_1(sel, atoms)
     return
   elseif sel == "bars" then
     local bars = clamp(num_or(atoms[1], 4), 1, 128)
-    self.length_beats = clamp(bars * max(1, self.timesig_num or 4), 1.0, 512.0)
+    self.length_beats = clamp(bars * max(1, self.timesig_num or 4), 1.0, 2048.0)
     Layout.clamp_view(self)
     self:save_state()
     self._dirty_l1 = true
@@ -822,6 +835,7 @@ function M:in_1(sel, atoms)
     Playback.release_playback_voices(self)
     if self.playing then Playback.emit_empty_list(self) end
     Model.push_undo(self)
+    Midi.clear_tracks(self)
     Model.clear_notes(self)
     local i = 1
     while i + 2 <= #atoms do
@@ -913,6 +927,7 @@ function M:in_1(sel, atoms)
     if #self.notes > 0 then
       Model.push_undo(self)
     end
+    Midi.clear_tracks(self)
     Model.clear_notes(self)
     self:outlet(4, "edited", { "clear" })
     self:save_state()
@@ -985,6 +1000,15 @@ function M:in_1(sel, atoms)
     self.shift_drag_dup = bool_from_atom(atoms[1], true)
     self:save_state()
     self._dirty_l1 = true
+    self._dirty_l3 = true
+    self:flush_repaint()
+    return
+  elseif sel == "follow" or sel == "follow_playhead" then
+    self.follow_playhead = bool_from_atom(atoms[1], true)
+    if self.follow_playhead and self.playing then
+      Playback.follow_view(self, true)
+    end
+    self:save_state()
     self._dirty_l3 = true
     self:flush_repaint()
     return
@@ -1106,6 +1130,38 @@ function M:in_1(sel, atoms)
     Input.reset_default_view(self)
     self:save_state()
     return
+  elseif sel == "import_midi" or sel == "load_midi" then
+    local path_str, track_opt = Midi.parse_import_atoms(atoms)
+    local ok, res = Midi.import_from_file(self, path_str, track_opt)
+    if ok then
+      Input.fit_view(self)
+      self:save_state()
+    else
+      self.hud_text = tostring(res)
+      self:error(tostring(res))
+      self._dirty_l3 = true
+      self:flush_repaint()
+    end
+    return
+  elseif sel == "export_midi" or sel == "save_midi" then
+    local path_str = Midi.parse_export_atoms(atoms)
+    local ok, res = Midi.export_to_file(self, path_str)
+    if not ok then
+      self.hud_text = tostring(res)
+      self:error(tostring(res))
+      self._dirty_l3 = true
+      self:flush_repaint()
+    end
+    return
+  elseif sel == "midi_track" or sel == "track" then
+    local ok, err = Midi.switch_track(self, atoms[1])
+    if not ok and err then
+      self.hud_text = tostring(err)
+      self:error(tostring(err))
+      self._dirty_l3 = true
+      self:flush_repaint()
+    end
+    return
   elseif sel == "key" then
     Input.on_key_list(self, atoms)
     return
@@ -1220,13 +1276,14 @@ function M:properties(p)
 
   p:new_frame("Transport & Grid", 2)
   p:add_float("BPM",            "prop_bpm",          self.bpm or 120.0, 20.0, 300.0)
-  p:add_float("Length (Beats)", "prop_length_beats", self.length_beats or 16.0, 1.0, 512.0)
+  p:add_float("Length (Beats)", "prop_length_beats", self.length_beats or 16.0, 1.0, 2048.0)
   p:add_int("Beats / Bar",      "prop_timesig_num",  self.timesig_num or 4, 1, 16)
   p:add_combo("Grid Division",  "prop_grid_div",     self.grid_div_idx or 5, Model.GRID_LABELS)
   p:add_check("Snap Enabled",   "prop_snap_enabled", self.snap_enabled and 1 or 0)
   p:add_combo("Snap Mode",      "prop_snap_mode",    self.snap_mode or 1, Model.SNAP_MODE_LABELS)
   p:add_check("Auto Rewind",    "prop_auto_rewind",  self.auto_rewind and 1 or 0)
   p:add_check("Loop Enabled",   "prop_loop_enabled", self.loop_enabled and 1 or 0)
+  p:add_check("Follow Playhead", "prop_follow_playhead", (self.follow_playhead ~= false) and 1 or 0)
 
   p:new_frame("MIDI & Editing", 2)
   p:add_combo("Default Length",   "prop_def_len_mode", self.default_len_mode or 1, Model.DEF_LEN_MODES)
@@ -1314,7 +1371,7 @@ function M:prop_bpm(v)
 end
 
 function M:prop_length_beats(v)
-  self.length_beats = clamp(num_or(v, 16.0), 1.0, 512.0)
+  self.length_beats = clamp(num_or(v, 16.0), 1.0, 2048.0)
   refresh_all(self)
 end
 
@@ -1491,6 +1548,16 @@ function M:prop_shift_drag_dup(v)
   self.shift_drag_dup = bool_from_atom(v, true)
   self:save_state()
   self._dirty_l1 = true
+  self._dirty_l3 = true
+  self:flush_repaint()
+end
+
+function M:prop_follow_playhead(v)
+  self.follow_playhead = bool_from_atom(v, true)
+  if self.follow_playhead and self.playing then
+    Playback.follow_view(self, true)
+  end
+  self:save_state()
   self._dirty_l3 = true
   self:flush_repaint()
 end

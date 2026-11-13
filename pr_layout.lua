@@ -117,6 +117,7 @@ function Layout.compute(self, w, h)
     add_btn("play", 22)
     add_btn("stop", 20)
     add_btn("loop", 22)
+    add_btn("follow", 22)
     cx = cx + 2
     if add_btn("bpm", 62) then
       local r = btns.bpm
@@ -139,6 +140,10 @@ function Layout.compute(self, w, h)
     cx = cx + 2
     add_btn("fit", 22)
     add_btn("clr", 22)
+    if self.midi_tracks and #self.midi_tracks > 1 then
+      cx = cx + 2
+      add_btn("midi_track", 38)
+    end
 
     -- Right-aligned modifier status badges [C][S][A]
     local mod_w = 16
