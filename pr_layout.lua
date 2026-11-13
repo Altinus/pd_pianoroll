@@ -116,28 +116,29 @@ function Layout.compute(self, w, h)
 
     add_btn("play", 22)
     add_btn("stop", 20)
-    add_btn("loop", 32)
+    add_btn("loop", 22)
     cx = cx + 2
-    if add_btn("bpm", 64) then
+    if add_btn("bpm", 62) then
       local r = btns.bpm
       local mw = 13
       btns.bpm_minus = { x = r.x, y = r.y, w = mw, h = r.h }
       btns.bpm_val   = { x = r.x + mw, y = r.y, w = r.w - mw * 2, h = r.h }
       btns.bpm_plus  = { x = r.x + r.w - mw, y = r.y, w = mw, h = r.h }
     end
-    add_btn("grid", 38)
-    add_btn("snap", 34)
-    add_btn("snap_mode", 28)
-    add_btn("len_mode", 38)
+    add_btn("grid", 36)
+    add_btn("snap", 22)
+    add_btn("snap_mode", 22)
+    add_btn("len_mode", 22)
+    add_btn("shift_dup", 22)
     cx = cx + 2
-    add_btn("undo", 28)
-    add_btn("redo", 28)
-    add_btn("cut",  26)
-    add_btn("copy", 26)
-    add_btn("paste", 26)
+    add_btn("undo", 22)
+    add_btn("redo", 22)
+    add_btn("cut",  22)
+    add_btn("copy", 22)
+    add_btn("paste", 22)
     cx = cx + 2
-    add_btn("fit", 26)
-    add_btn("clr", 26)
+    add_btn("fit", 22)
+    add_btn("clr", 22)
 
     -- Right-aligned modifier status badges [C][S][A]
     local mod_w = 16

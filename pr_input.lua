@@ -43,6 +43,35 @@ local function mark_all_dirty(self)
   self._dirty_l3 = true
 end
 
+-- Pure cursor-anchored zoom-in & boundary-clamped zoom-out horizontal solver
+local function apply_hzoom(self, layout, new_ppb, orig_ppb, orig_extra, anchor_beat, anchor_rel_x)
+  self.px_per_beat = new_ppb
+  local base_h_total = max(self.length_beats or 16, self.max_end_beat or 0, 4.0)
+  local h_vis_new = layout.roll.w / new_ppb
+  local raw_vb = anchor_beat - anchor_rel_x / new_ppb
+
+  if new_ppb > orig_ppb + 1e-9 then
+    -- Zoom IN: anchor strictly at initial mouse beat (never stick to left/right edge)
+    local new_vb = max(0.0, raw_vb)
+    local needed_extra = max(0.0, new_vb + h_vis_new - base_h_total)
+    self._pan_extra_beats = (new_vb > 1e-4) and needed_extra or 0.0
+    self.view_beat = new_vb
+  else
+    -- Zoom OUT: anchor at mouse until left (0) or right content boundary hits viewport edge
+    local right_limit = base_h_total + (orig_extra or 0.0)
+    local max_vb = max(0.0, right_limit - h_vis_new)
+    local clamped_vb = max(0.0, min(max_vb, raw_vb))
+    self.view_beat = clamped_vb
+    if clamped_vb <= 1e-4 and h_vis_new >= base_h_total - 1e-4 then
+      self._pan_extra_beats = 0.0
+    else
+      self._pan_extra_beats = max(0.0, min(orig_extra or 0.0, clamped_vb + h_vis_new - base_h_total))
+    end
+  end
+
+  Layout.clamp_view(self, layout)
+end
+
 function Input.fit_view(self)
   local w, h = self:get_size()
   local layout = Layout.compute(self, w, h)
@@ -398,6 +427,14 @@ local function handle_toolbar_down(self, layout, x, y)
     self._dirty_l1 = true
     self:flush_repaint()
     return true
+  elseif Layout.in_rect(x, y, btns.shift_dup) then
+    self.shift_drag_dup = (self.shift_drag_dup == false)
+    self.hud_text = "Shift+Drag Copy: " .. (self.shift_drag_dup and "ON" or "OFF")
+    self:save_state()
+    self._dirty_l1 = true
+    self._dirty_l3 = true
+    self:flush_repaint()
+    return true
   elseif Layout.in_rect(x, y, btns.undo) then
     Input.action_undo(self)
     return true
@@ -514,8 +551,7 @@ function Input.mouse_down(self, x, y)
     self.drag_mode = "hzoom_grip"
     self.drag_start_x = x
     self.drag_orig_ppb = self.px_per_beat
-    local base_h_total = max(self.length_beats or 16, self.max_end_beat or 0, 4.0)
-    self.drag_anchor_left = ((self.view_beat or 0.0) <= 1e-4) and ((self._pan_extra_beats or 0.0) <= 1e-4) and (base_h_total <= (layout.roll.w / self.px_per_beat) + 0.05)
+    self.drag_orig_pan_extra = self._pan_extra_beats or 0.0
     self.drag_anchor_beat = self.view_beat + (layout.roll.w * 0.5) / self.px_per_beat
     self.hud_text = string.format("H-Zoom: %.0f px/b", self.px_per_beat)
     self._dirty_l3 = true
@@ -670,8 +706,54 @@ function Input.mouse_down(self, x, y)
       return
     end
 
-    -- Shift + click existing note -> add to selection
+    -- Shift + click/drag existing note:
+    --   * When shift_drag_dup ON & on note body: Shift+Drag duplicates (FL-style); Shift+Click adds to selection
+    --   * When shift_drag_dup OFF or on tail: Shift+Click adds to selection
     if shift then
+      if self.shift_drag_dup ~= false and not is_tail then
+        local prev_sel = {}
+        if self.selected_ids then
+          for k, v in pairs(self.selected_ids) do prev_sel[k] = v end
+        end
+        local hit_was_sel = Model.is_selected(self, hit.id)
+        local targets = hit_was_sel and Model.get_selected_notes(self) or { hit }
+        local snaps = {}
+        for i = 1, #targets do
+          local sn = targets[i]
+          snaps[i] = {
+            note       = sn,
+            start_beat = sn.start_beat,
+            pitch      = sn.pitch,
+            length     = sn.length,
+          }
+        end
+        self._shift_dup_armed   = true
+        self._shift_dup_done    = false
+        self._shift_prev_sel    = prev_sel
+        self._shift_hit_was_sel = hit_was_sel
+        self._collapse_on_up_id = nil
+        self._pending_undo_snap = Model.capture_snapshot(self)
+        self.drag_mode          = "move"
+        self.drag_is_dup        = false
+        self.drag_note          = hit
+        self.drag_snaps         = snaps
+        self.drag_start_x       = x
+        self.drag_start_y       = y
+        self.drag_mouse_beat    = beat
+        self.drag_mouse_pitch   = pitch
+        self.drag_orig_start    = hit.start_beat
+        self.drag_orig_pitch    = hit.pitch
+        self.drag_orig_len      = hit.length
+        self.drag_moved         = false
+        if self.preview_on_edit ~= false then
+          Playback.start_audition(self, hit.pitch, hit.velocity)
+        end
+        self.hud_text = string.format("Shift+Drag: Duplicate (%d)", #snaps)
+        self._dirty_l3 = true
+        self:flush_repaint()
+        return
+      end
+
       if not self.selected_ids then self.selected_ids = {} end
       self.selected_ids[hit.id] = true
       self.primary_sel_id = hit.id
@@ -750,6 +832,7 @@ function Input.mouse_down(self, x, y)
 
     self._pending_undo_snap = Model.capture_snapshot(self)
     self.drag_mode          = is_tail and "resize" or "move"
+    self.drag_is_dup        = false
     self.drag_note         = hit
     self.drag_snaps        = snaps
     self.drag_start_x      = x
@@ -803,8 +886,7 @@ function Input.mouse_down(self, x, y)
     self.drag_start_y = y
     self.drag_orig_ppb = self.px_per_beat
     self.drag_orig_ppp = self.px_per_pitch
-    local base_h_total = max(self.length_beats or 16, self.max_end_beat or 0, 4.0)
-    self.drag_anchor_left    = ((self.view_beat or 0.0) <= 1e-4) and ((self._pan_extra_beats or 0.0) <= 1e-4) and (base_h_total <= (layout.roll.w / self.px_per_beat) + 0.05)
+    self.drag_orig_pan_extra = self._pan_extra_beats or 0.0
     self.drag_anchor_beat    = Layout.px_to_beat(self, layout, x)
     self.drag_anchor_pitch_f = Layout.py_to_pitch_float(self, layout, y)
     self.drag_anchor_rel_x   = x - layout.roll.x
@@ -911,20 +993,7 @@ function Input.mouse_drag(self, x, y)
     local dx = x - self.drag_start_x
     local factor = exp(dx * 0.010)
     local new_ppb = max(Layout.MIN_PPB, min(Layout.MAX_PPB, self.drag_orig_ppb * factor))
-    self.px_per_beat = new_ppb
-    local base_h_total = max(self.length_beats or 16, self.max_end_beat or 0, 4.0)
-    local h_vis_new = layout.roll.w / new_ppb
-    if (h_vis_new >= base_h_total and (self._pan_extra_beats or 0.0) <= 1e-4) or self.drag_anchor_left then
-      self._pan_extra_beats = 0.0
-      self.view_beat = 0.0
-    else
-      local new_vb = max(0.0, self.drag_anchor_beat - (layout.roll.w * 0.5) / new_ppb)
-      self.view_beat = new_vb
-      if (self._pan_extra_beats or 0.0) > 0.0 then
-        self._pan_extra_beats = max(0.0, min(self._pan_extra_beats, max(0.0, new_vb + h_vis_new - base_h_total)))
-      end
-    end
-    Layout.clamp_view(self, layout)
+    apply_hzoom(self, layout, new_ppb, self.drag_orig_ppb, self.drag_orig_pan_extra or 0.0, self.drag_anchor_beat, layout.roll.w * 0.5)
     self.hud_text = string.format("H-Zoom: %.0f px/b", self.px_per_beat)
     mark_all_dirty(self)
     self:flush_repaint()
@@ -951,24 +1020,8 @@ function Input.mouse_drag(self, x, y)
     else
       local factor = exp(dx * 0.010)
       local new_ppb = max(Layout.MIN_PPB, min(Layout.MAX_PPB, self.drag_orig_ppb * factor))
-      self.px_per_beat = new_ppb
-      local base_h_total = max(self.length_beats or 16, self.max_end_beat or 0, 4.0)
-      local h_vis_new = layout.roll.w / new_ppb
-      if (h_vis_new >= base_h_total and (self._pan_extra_beats or 0.0) <= 1e-4) or self.drag_anchor_left then
-        -- Filling screen ("铺满屏幕"): keep left edge (beat 0) anchored
-        self._pan_extra_beats = 0.0
-        self.view_beat = 0.0
-        self.hud_text = string.format("H-Zoom (Left): %.0f px/b", self.px_per_beat)
-      else
-        -- Scrollable: keep beat under initial mouse X anchored cleanly
-        local new_vb = max(0.0, self.drag_anchor_beat - self.drag_anchor_rel_x / new_ppb)
-        self.view_beat = new_vb
-        if (self._pan_extra_beats or 0.0) > 0.0 then
-          self._pan_extra_beats = max(0.0, min(self._pan_extra_beats, max(0.0, new_vb + h_vis_new - base_h_total)))
-        end
-        self.hud_text = string.format("H-Zoom (Mouse): %.0f px/b", self.px_per_beat)
-      end
-      Layout.clamp_view(self, layout)
+      apply_hzoom(self, layout, new_ppb, self.drag_orig_ppb, self.drag_orig_pan_extra or 0.0, self.drag_anchor_beat, self.drag_anchor_rel_x)
+      self.hud_text = string.format("H-Zoom: %.0f px/b", self.px_per_beat)
     end
     mark_all_dirty(self)
     self:flush_repaint()
@@ -1091,6 +1144,43 @@ function Input.mouse_drag(self, x, y)
     if self.drag_moved then
       self._last_note_click_time = nil
     end
+    local just_cloned = false
+    if self._shift_dup_armed and not self._shift_dup_done then
+      if not (self.drag_moved or abs(x - (self.drag_start_x or x)) >= 3 or abs(y - (self.drag_start_y or y)) >= 3) then
+        return
+      end
+      self._shift_dup_done = true
+      self.drag_is_dup = true
+      local orig_snaps = self.drag_snaps or { { note = note, start_beat = self.drag_orig_start, pitch = self.drag_orig_pitch, length = self.drag_orig_len } }
+      local new_snaps = {}
+      local new_sel = {}
+      local new_primary = nil
+      for i = 1, #orig_snaps do
+        local s = orig_snaps[i]
+        local orig_n = s.note
+        local cloned = Model.add_note(self, s.pitch, s.start_beat, s.length, orig_n and orig_n.velocity or self.default_vel)
+        new_sel[cloned.id] = true
+        new_snaps[i] = {
+          note       = cloned,
+          start_beat = s.start_beat,
+          pitch      = s.pitch,
+          length     = s.length,
+        }
+        if orig_n and orig_n.id == note.id then
+          new_primary = cloned
+        end
+      end
+      self.selected_ids = new_sel
+      if new_primary then
+        note = new_primary
+        self.drag_note = new_primary
+        self.primary_sel_id = new_primary.id
+      end
+      self.drag_snaps = new_snaps
+      self._ctrl_selected = (#new_snaps > 1)
+      just_cloned = true
+    end
+
     local snaps = self.drag_snaps or { { note = note, start_beat = self.drag_orig_start, pitch = self.drag_orig_pitch, length = self.drag_orig_len } }
     local raw_db = beat - self.drag_mouse_beat
     local db
@@ -1125,14 +1215,16 @@ function Input.mouse_drag(self, x, y)
       end
     end
 
-    if changed then
+    if changed or just_cloned then
       self.last_note_len = note.length
       Model.recompute_max_end(self)
       Playback.sync_note_modified(self, note)
-      if note.pitch ~= old_pitch and self.preview_on_edit ~= false then
+      if changed and note.pitch ~= old_pitch and self.preview_on_edit ~= false then
         Playback.start_audition(self, note.pitch, note.velocity)
       end
-      self.hud_text = string.format("%s (%d)  %.2fb", Model.pitch_name(note.pitch), note.pitch, note.start_beat)
+      local prefix = self.drag_is_dup and "DUP " or ""
+      self.hud_text = string.format("%s%s (%d)  %.2fb", prefix, Model.pitch_name(note.pitch), note.pitch, note.start_beat)
+      if just_cloned then self._dirty_l1 = true end
       self._dirty_l2 = true
       self._dirty_l3 = true
       self:flush_repaint()
@@ -1244,7 +1336,25 @@ function Input.mouse_up(self, x, y)
     end
     self.events_dirty = true
     if self.playing then Model.rebuild_events(self) end
-    if mode == "move" or mode == "resize" then
+    if mode == "move" and self._shift_dup_armed then
+      if not self._shift_dup_done then
+        -- Released without dragging >= 3px -> fallback to Shift+Click add-to-selection
+        if self.drag_note then
+          self.selected_ids = self._shift_prev_sel or {}
+          self.selected_ids[self.drag_note.id] = true
+          self.primary_sel_id = self.drag_note.id
+          self._ctrl_selected = (Model.count_selected(self) > 1)
+        end
+        self._pending_undo_snap = nil
+      else
+        if self._pending_undo_snap then
+          Model.push_undo(self, self._pending_undo_snap)
+          self._pending_undo_snap = nil
+        end
+        self:outlet(4, "edited", { "duplicate", self.drag_snaps and #self.drag_snaps or 1 })
+        self:save_state()
+      end
+    elseif mode == "move" or mode == "resize" then
       if self._pending_undo_snap then
         if not Model.snapshots_equal(self._pending_undo_snap, Model.capture_snapshot(self)) then
           Model.push_undo(self, self._pending_undo_snap)
@@ -1260,7 +1370,12 @@ function Input.mouse_up(self, x, y)
 
   self._pending_undo_snap  = nil
   self._collapse_on_up_id  = nil
-  self.drag_anchor_left    = nil
+  self._shift_dup_armed    = nil
+  self._shift_dup_done     = nil
+  self._shift_prev_sel     = nil
+  self._shift_hit_was_sel  = nil
+  self.drag_is_dup         = nil
+  self.drag_orig_pan_extra = nil
   self.drag_scroll_per_px  = nil
   self.drag_scroll_min     = nil
   self.drag_scroll_max     = nil
@@ -1294,6 +1409,8 @@ end
 
 function Input.mouse_move(self, x, y)
   self._mouse_inside = true
+  self.hover_x = x
+  self.hover_y = y
   if self.drag_mode then return end
 
   local w, h = self:get_size()
@@ -1303,7 +1420,7 @@ function Input.mouse_move(self, x, y)
 
   if Layout.in_rect(x, y, layout.toolbar) then
     for name, r in pairs(layout.btns) do
-      if name ~= "info_area" and name ~= "bpm_minus" and name ~= "bpm_plus" and name ~= "bpm_val" then
+      if name ~= "info_area" and name ~= "bpm" then
         if Layout.in_rect(x, y, r) then
           new_region = "btn"
           new_btn = name

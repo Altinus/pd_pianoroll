@@ -139,6 +139,9 @@ function M:save_state()
     self.grid_contrast or 1.0,
     -3, -- v3 extension header sentinel (preserves v1 & v2 patch loading)
     (self.single_key_hotkeys ~= false) and 1 or 0,
+    -4, -- v4 extension header sentinel (preserves v1, v2 & v3 patch loading)
+    (self.show_tooltips ~= false) and 1 or 0,
+    (self.shift_drag_dup ~= false) and 1 or 0,
   }
 
   local note_atoms = Model.serialize_notes(self)
@@ -258,6 +261,8 @@ function M:initialize(sel, atoms)
   self.hover_note_tail  = false
   self.hover_pitch      = nil
   self.single_key_hotkeys = true
+  self.show_tooltips      = true
+  self.shift_drag_dup     = true
   self._mouse_inside      = false
   self._pan_extra_beats   = 0.0
   self.undo_stack         = {}
@@ -325,6 +330,11 @@ function M:initialize(sel, atoms)
       if n_atoms >= note_start + 1 and num_or(atoms[note_start], 0) == -3 then
         self.single_key_hotkeys = (num_or(atoms[note_start + 1], 1) ~= 0)
         note_start = note_start + 2
+        if n_atoms >= note_start + 2 and num_or(atoms[note_start], 0) == -4 then
+          self.show_tooltips  = (num_or(atoms[note_start + 1], 1) ~= 0)
+          self.shift_drag_dup = (num_or(atoms[note_start + 2], 1) ~= 0)
+          note_start = note_start + 3
+        end
       end
     end
 
@@ -444,6 +454,8 @@ function M:prereload()
     tick_ms = self.tick_ms,
     redraw_ms = self.redraw_ms,
     single_key_hotkeys = self.single_key_hotkeys,
+    show_tooltips = self.show_tooltips,
+    shift_drag_dup = self.shift_drag_dup,
     _pan_extra_beats = self._pan_extra_beats,
     undo_stack = self.undo_stack,
     redo_stack = self.redo_stack,
@@ -963,6 +975,19 @@ function M:in_1(sel, atoms)
     self.single_key_hotkeys = bool_from_atom(atoms[1], true)
     self:save_state()
     return
+  elseif sel == "tooltips" or sel == "show_tooltips" then
+    self.show_tooltips = bool_from_atom(atoms[1], true)
+    self:save_state()
+    self._dirty_l3 = true
+    self:flush_repaint()
+    return
+  elseif sel == "shift_dup" or sel == "shift_drag_dup" then
+    self.shift_drag_dup = bool_from_atom(atoms[1], true)
+    self:save_state()
+    self._dirty_l1 = true
+    self._dirty_l3 = true
+    self:flush_repaint()
+    return
   elseif sel == "select_all" then
     Model.select_all(self)
     self._ctrl_selected = (#self.notes > 0)
@@ -1208,6 +1233,7 @@ function M:properties(p)
   p:add_int("Default Velocity",   "prop_default_vel",  self.default_vel or 100, 1, 127)
   p:add_check("Audition on Edit", "prop_preview_edit", self.preview_on_edit and 1 or 0)
   p:add_check("Preview to Out 1", "prop_preview_out1", self.preview_to_out1 and 1 or 0)
+  p:add_check("Shift+Drag Duplicate", "prop_shift_drag_dup", (self.shift_drag_dup ~= false) and 1 or 0)
   p:add_check("Hover Hotkeys (Z/C/X/V)", "prop_single_hotkeys", (self.single_key_hotkeys ~= false) and 1 or 0)
   p:add_float("Horiz Zoom",       "prop_px_per_beat",  self.px_per_beat or Layout.DEF_PPB, Layout.MIN_PPB, Layout.MAX_PPB)
   p:add_float("Vert Zoom",        "prop_px_per_pitch", self.px_per_pitch or Layout.DEF_PPP, Layout.MIN_PPP, Layout.MAX_PPP)
@@ -1231,6 +1257,7 @@ function M:properties(p)
   p:add_check("Show Playhead",    "prop_show_playhead",   self.show_playhead and 1 or 0)
   p:add_check("Highlight Rows",   "prop_highlight_rows",  self.highlight_rows and 1 or 0)
   p:add_check("Velocity Shading", "prop_velocity_shade",  self.velocity_shade and 1 or 0)
+  p:add_check("Show Tooltips",    "prop_show_tooltips",   (self.show_tooltips ~= false) and 1 or 0)
   p:add_int("UI Redraw (ms)",     "prop_redraw_ms",       self.redraw_ms or 33, 16, 100)
 end
 
@@ -1451,6 +1478,21 @@ end
 function M:prop_single_hotkeys(v)
   self.single_key_hotkeys = bool_from_atom(v, true)
   self:save_state()
+end
+
+function M:prop_show_tooltips(v)
+  self.show_tooltips = bool_from_atom(v, true)
+  self:save_state()
+  self._dirty_l3 = true
+  self:flush_repaint()
+end
+
+function M:prop_shift_drag_dup(v)
+  self.shift_drag_dup = bool_from_atom(v, true)
+  self:save_state()
+  self._dirty_l1 = true
+  self._dirty_l3 = true
+  self:flush_repaint()
 end
 
 local _unused = table_unpack

@@ -454,9 +454,10 @@ click(dmx, dmy)
 harness.assert_eq(#obj.notes, 0, "double-clicking one selected note deleted all 3 selected notes simultaneously")
 
 -- ----------------------------------------------------------------------------
--- Test 10: Shift + Horizontal Zoom Anchoring (Left when Screen-Filled, Cursor when Scrollable)
+-- Test 10: Shift + Horizontal Zoom Anchoring (Zoom-IN always cursor-anchored; Zoom-OUT clamps at edges)
 -- ----------------------------------------------------------------------------
 -- Case A: Full clip fits screen (px_per_beat = 30 -> visible beats > 16, view_beat = 0)
+-- Zooming IN MUST anchor at initial mouse beat (never snap/stick to left/right edge!)
 send_msg(1, "length", 16)
 send_msg(3, "zoom", 30, 13)
 send_msg(3, "scroll", 0.0, 82)
@@ -465,9 +466,12 @@ assert(layout.h_visible_beats >= 16.0, "zoom 30 fits full 16-beat sequence on sc
 send_msg(4, "list", 1, "Shift_L")
 local sx_a = layout.roll.x + layout.roll.w * 0.65
 local sy_a = layout.roll.y + layout.roll.h * 0.5
-drag(sx_a, sy_a, sx_a + 55, sy_a, 4)
+local beat_full_before = Layout.px_to_beat(obj, layout, sx_a)
+drag(sx_a, sy_a, sx_a + 85, sy_a, 4)
+local beat_full_after = Layout.px_to_beat(obj, Layout.compute(obj), sx_a)
 assert(obj.px_per_beat > 30.0, "Shift+drag right zoomed in from full-screen view")
-harness.assert_near(obj.view_beat, 0.0, 0.001, "Screen-filled horizontal zoom anchored at left edge (view_beat == 0)")
+assert(obj.view_beat > 1.0, "Zooming IN from full-screen anchored at mouse instead of sticking at view_beat == 0 (vb=" .. tostring(obj.view_beat) .. ")")
+harness.assert_near(beat_full_after, beat_full_before, 0.02, "Full-screen Zoom IN strictly anchored at mouse cursor beat")
 
 -- Case B: Zoomed in / scrollable -> strictly anchors at cursor beat
 send_msg(3, "zoom", 120, 13)
@@ -481,8 +485,28 @@ local beat_cursor_after = Layout.px_to_beat(obj, Layout.compute(obj), sx_b)
 assert(obj.px_per_beat > 120.0, "Shift+drag right zoomed in while scrollable")
 harness.assert_near(beat_cursor_after, beat_cursor_before, 0.02, "Scrollable horizontal zoom strictly anchored at cursor X")
 
--- Case C: Zooming back out to full screen settles cleanly at view_beat == 0
-drag(sx_b, sy_b, sx_b - 220, sy_b, 6)
+-- Case C: Zooming IN from scrollbar RIGHT edge also strictly anchors at cursor beat (no right-edge stickiness!)
+send_msg(3, "zoom", 80, 13)
+layout = Layout.compute(obj)
+send_msg(3, "scroll", layout.h_range_beats, 82)
+layout = Layout.compute(obj)
+local sx_r = layout.roll.x + layout.roll.w * 0.25
+local sy_r = layout.roll.y + layout.roll.h * 0.5
+local beat_right_before = Layout.px_to_beat(obj, layout, sx_r)
+drag(sx_r, sy_r, sx_r + 75, sy_r, 4)
+local beat_right_after = Layout.px_to_beat(obj, Layout.compute(obj), sx_r)
+harness.assert_near(beat_right_after, beat_right_before, 0.02, "Zoom IN from right scrollbar edge strictly anchored at mouse cursor")
+
+-- Case D: Zooming OUT keeps cursor anchor while interior, then anchors edge when hitting boundary -> settles cleanly at 0
+send_msg(3, "zoom", 160, 13)
+send_msg(3, "scroll", 4.0, 82)
+layout = Layout.compute(obj)
+local sx_o = layout.roll.x + layout.roll.w * 0.5
+local beat_out_before = Layout.px_to_beat(obj, layout, sx_o)
+drag(sx_o, sy_b, sx_o - 30, sy_b, 3) -- small zoom out inside [0..16] bounds
+local beat_out_mid = Layout.px_to_beat(obj, Layout.compute(obj), sx_o)
+harness.assert_near(beat_out_mid, beat_out_before, 0.02, "Interior zoom OUT preserved cursor anchor before hitting edges")
+drag(sx_o, sy_b, sx_o - 260, sy_b, 6) -- big zoom out past full sequence
 harness.assert_near(obj.view_beat, 0.0, 0.001, "Zooming back out settles view_beat cleanly to 0")
 send_msg(4, "list", 0, "Shift_L")
 
@@ -840,26 +864,147 @@ click(mod_c.x + mod_c.w * 0.5, mod_c.y + mod_c.h * 0.5) -- unlatch [C]
 -- ----------------------------------------------------------------------------
 -- Test 18: Active Multi-Note Edit Layer-3 Feedback Render Smoke Check
 -- ----------------------------------------------------------------------------
-send_msg(1, "select_all")
-local l3_idle, l3_active = 0, 0
-local noop3 = function() end
-local function make_spy3(inc)
-  return setmetatable({
-    fill_rect          = inc,
-    stroke_rect        = inc,
-    fill_rounded_rect  = inc,
-    stroke_rounded_rect = inc,
-    draw_line          = inc,
-    draw_text          = inc,
-  }, { __index = function() return noop3 end })
+do
+  send_msg(1, "select_all")
+  local l3_idle, l3_active = 0, 0
+  local noop3 = function() end
+  local function make_spy3(inc)
+    return setmetatable({
+      fill_rect           = inc,
+      stroke_rect         = inc,
+      fill_rounded_rect   = inc,
+      stroke_rounded_rect = inc,
+      draw_line           = inc,
+      draw_text           = inc,
+    }, { __index = function() return noop3 end })
+  end
+  Render.paint_layer_3(obj, make_spy3(function() l3_idle = l3_idle + 1 end))
+  obj:mouse_down(roll_xy_for(obj.notes[1].start_beat + 0.1, obj.notes[1].pitch))
+  obj:mouse_drag(roll_xy_for(obj.notes[1].start_beat + 0.6, obj.notes[1].pitch + 2))
+  Render.paint_layer_3(obj, make_spy3(function() l3_active = l3_active + 1 end))
+  assert(l3_active > l3_idle + 8 and l3_active > 15,
+         "Active multi-note edit Layer 3 emitted ghost/guide/halo overlays (idle=" .. tostring(l3_idle) .. ", active=" .. tostring(l3_active) .. ")")
+  obj:mouse_up(roll_xy_for(obj.notes[1].start_beat + 0.6, obj.notes[1].pitch + 2))
 end
-Render.paint_layer_3(obj, make_spy3(function() l3_idle = l3_idle + 1 end))
-obj:mouse_down(roll_xy_for(obj.notes[1].start_beat + 0.1, obj.notes[1].pitch))
-obj:mouse_drag(roll_xy_for(obj.notes[1].start_beat + 0.6, obj.notes[1].pitch + 2))
-Render.paint_layer_3(obj, make_spy3(function() l3_active = l3_active + 1 end))
-assert(l3_active > l3_idle + 8 and l3_active > 15,
-       "Active multi-note edit Layer 3 emitted ghost/guide/halo overlays (idle=" .. tostring(l3_idle) .. ", active=" .. tostring(l3_active) .. ")")
-obj:mouse_up(roll_xy_for(obj.notes[1].start_beat + 0.6, obj.notes[1].pitch + 2))
+
+-- ----------------------------------------------------------------------------
+-- Test 19: Vector SVG Icons (draw_svg) & Toggleable Hover Tooltips
+-- ----------------------------------------------------------------------------
+do
+  local svg_calls = 0
+  local svg_samples = {}
+  local noop_svg = function() end
+  local spy_svg = setmetatable({
+    draw_svg = function(_, xml, x, y)
+      svg_calls = svg_calls + 1
+      if #svg_samples < 5 then
+        svg_samples[#svg_samples + 1] = { xml = xml, x = x, y = y }
+      end
+    end,
+  }, { __index = function() return noop_svg end })
+  Render.paint_layer_1(obj, spy_svg)
+  assert(svg_calls >= 15, "Layer 1 rendered >= 15 vector SVG icons via g:draw_svg (got " .. tostring(svg_calls) .. ")")
+  for i = 1, #svg_samples do
+    local xml = svg_samples[i].xml
+    assert(type(xml) == "string" and xml:find("<svg", 1, true) and xml:find('viewBox="0 0 14 14"', 1, true),
+           "SVG icon has valid 14x14 viewBox")
+    assert(not xml:find("currentColor", 1, true) and not xml:find("<style", 1, true),
+           "SVG icon avoids unsupported NanoSVG constructs")
+  end
+
+  local lay = Layout.compute(obj)
+  local sd_b = lay.btns.shift_dup
+  assert(sd_b ~= nil, "Toolbar has shift_dup SVG toggle button")
+  obj:mouse_move(sd_b.x + sd_b.w * 0.5, sd_b.y + sd_b.h * 0.5)
+  harness.assert_eq(obj.hover_region, "btn", "hover_region == btn on shift_dup pill")
+  harness.assert_eq(obj.hover_btn, "shift_dup", "hover_btn == shift_dup")
+  local tip_sd = Render.get_hover_tooltip(obj, lay)
+  assert(tip_sd and tip_sd:find("Shift%+Drag", 1), "shift_dup tooltip explains FL-style duplicate")
+
+  local tip_texts_on, tip_texts_off = 0, 0
+  local noop_t = function() end
+  Render.paint_layer_3(obj, setmetatable({
+    draw_text = function(_, txt)
+      if txt == tip_sd then tip_texts_on = tip_texts_on + 1 end
+    end,
+  }, { __index = function() return noop_t end }))
+  harness.assert_eq(tip_texts_on, 1, "Layer 3 rendered floating hover tooltip when show_tooltips == true")
+
+  obj:prop_show_tooltips(0)
+  assert(obj.show_tooltips == false, "prop_show_tooltips(0) disabled tooltips")
+  Render.paint_layer_3(obj, setmetatable({
+    draw_text = function(_, txt)
+      if txt == tip_sd then tip_texts_off = tip_texts_off + 1 end
+    end,
+  }, { __index = function() return noop_t end }))
+  harness.assert_eq(tip_texts_off, 0, "Layer 3 suppressed tooltip cleanly when show_tooltips == false")
+
+  send_msg(1, "tooltips", 1)
+  assert(obj.show_tooltips == true, "inlet 1 'tooltips 1' re-enabled tooltips")
+  obj:mouse_move(lay.corner_bl.x + lay.corner_bl.w * 0.5, lay.corner_bl.y + lay.corner_bl.h * 0.5)
+  harness.assert_eq(obj.hover_region, "corner_bl", "hover_region == corner_bl on bottom-left reset icon")
+  local tip_rst = Render.get_hover_tooltip(obj, lay)
+  assert(tip_rst and tip_rst:find("Reset", 1, true), "corner_bl reset tooltip returned")
+  obj:mouse_exit(-10, -10)
+end
+
+-- ----------------------------------------------------------------------------
+-- Test 20: FL Studio Style Shift + Drag Note Duplicate Mode
+-- ----------------------------------------------------------------------------
+do
+  send_msg(1, "reset_view")
+  send_msg(1, "grid", "1/16")
+  send_msg(1, "snap", 1)
+  send_msg(1, "snap_mode", "abs")
+  send_msg(1, "shift_dup", 1)
+  send_msg(1, "set_notes",
+    60, 0.0, 0.5, 100,
+    64, 0.5, 0.5, 100
+  )
+  Model.init_history(obj)
+  Model.select_only(obj, obj.notes[1].id)
+
+  -- A) Plain Shift + Click without drag MUST still add note to selection without duplicating!
+  send_msg(4, "list", 1, "Shift_L")
+  local scx, scy = roll_xy_for(0.65, 64)
+  click(scx, scy)
+  harness.assert_eq(#obj.notes, 2, "Shift+Click without drag did not create a duplicate")
+  harness.assert_eq(Model.count_selected(obj), 2, "Shift+Click added second note to selection")
+
+  -- B) Shift + Drag selected group clones BOTH notes smoothly & keeps originals intact + 1-step Undo!
+  local sdx0, sdy0 = roll_xy_for(0.15, 60)
+  local sdx1, sdy1 = roll_xy_for(2.15, 62)
+  obj:mouse_down(sdx0, sdy0)
+  obj:mouse_drag(sdx1, sdy1)
+  assert(obj.drag_is_dup == true, "Shift+Drag marked drag_is_dup == true during drag")
+  obj:mouse_up(sdx1, sdy1)
+
+  harness.assert_eq(#obj.notes, 4, "Shift+Drag duplicated 2 selected notes to 4 total notes")
+  local dup_sel = Model.get_selected_notes(obj)
+  harness.assert_eq(#dup_sel, 2, "only the 2 newly duplicated notes are selected after FL-style copy")
+  table.sort(dup_sel, function(a, b) return a.start_beat < b.start_beat end)
+  harness.assert_eq(dup_sel[1].pitch, 62, "first cloned note transposed +2 semitones to pitch 62")
+  harness.assert_near(dup_sel[1].start_beat, 2.0, 0.01, "first cloned note placed cleanly at beat 2.0")
+  harness.assert_eq(dup_sel[2].pitch, 66, "second cloned note transposed +2 semitones to pitch 66")
+  harness.assert_near(dup_sel[2].start_beat, 2.5, 0.01, "second cloned note placed cleanly at beat 2.5")
+
+  -- Undo cleanly removes both clones in a single step
+  send_msg(4, "list", 0, "Shift_L")
+  send_msg(1, "undo")
+  harness.assert_eq(#obj.notes, 2, "Undo removed both Shift+Drag clones in 1 step")
+
+  -- C) Toggle off via toolbar shift_dup icon -> Shift+Drag no longer duplicates
+  local lay = Layout.compute(obj)
+  local sdb = lay.btns.shift_dup
+  click(sdb.x + sdb.w * 0.5, sdb.y + sdb.h * 0.5)
+  assert(obj.shift_drag_dup == false, "toolbar shift_dup icon toggled Shift+Drag duplicate OFF")
+  Model.select_only(obj, obj.notes[1].id)
+  send_msg(4, "list", 1, "Shift_L")
+  drag(sdx0, sdy0, sdx1, sdy1, 3)
+  send_msg(4, "list", 0, "Shift_L")
+  harness.assert_eq(#obj.notes, 2, "With shift_drag_dup OFF, Shift+Drag did not create clones")
+  send_msg(1, "shift_dup", 1)
+end
 
 -- Restore clean 720x380 view & populate rich demo pattern for preview.svg inspection
 send_msg(1, "resize", 720, 380)
@@ -896,12 +1041,18 @@ obj:prop_note_color({ 84, 214, 184 })
 obj:prop_grid_color({ 88, 96, 110 })
 obj:prop_grid_contrast(1.1)
 harness.assert_near(obj.bpm, 128, 0.001, "prop_bpm updated bpm")
+obj:prop_show_tooltips(0)
+obj:prop_shift_drag_dup(0)
 obj:save_state()
 local fn_get_args = obj.get_args
 if type(fn_get_args) == "function" then
   local saved_args = fn_get_args(obj)
-  assert(saved_args and saved_args[52] == -2 and saved_args[57] == -3 and #saved_args > 58,
-         "save_state persisted v2/v3 headers + notes in args")
+  assert(saved_args and saved_args[52] == -2 and saved_args[57] == -3 and saved_args[59] == -4 and #saved_args > 61,
+         "save_state persisted v2/v3/v4 headers + notes in args")
+  harness.assert_eq(saved_args[60], 0, "show_tooltips=false persisted under -4 header")
+  harness.assert_eq(saved_args[61], 0, "shift_drag_dup=false persisted under -4 header")
 end
+obj:prop_show_tooltips(1)
+obj:prop_shift_drag_dup(1)
 
 pd.post("[TEST PASSED] All pianoroll DAW interaction, protocol & layout assertions succeeded.")

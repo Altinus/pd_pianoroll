@@ -8,6 +8,7 @@
 local Theme  = require("pr_theme")
 local Layout = require("pr_layout")
 local Model  = require("pr_model")
+local Icons  = require("pr_icons")
 
 local Render = {}
 
@@ -92,43 +93,34 @@ local function draw_toolbar(self, g, layout, pal)
     end
   end
 
+  local function draw_icon_pill(r, active, col_on, icon_name, icon_col, icon_alpha)
+    if not r then return end
+    draw_pill(r, active, col_on, nil)
+    local fg
+    if active then
+      fg = Theme.contrast_text(col_on or pal.toolbar_btn_on)
+    else
+      fg = icon_col or pal.toolbar_text
+    end
+    Icons.draw(g, icon_name, r, fg, icon_alpha or 0.96, 14)
+  end
+
   -- Play / Pause button
   if btns.play then
-    local r = btns.play
-    draw_pill(r, self.playing, pal.note_fill, nil)
-    local cx = r.x + r.w * 0.5
-    local cy = r.y + r.h * 0.5
-    if self.playing then
-      set_rgb(g, Theme.contrast_text(pal.note_fill), 1.0)
-      local bh = max(6, floor(r.h * 0.52))
-      g:fill_rect(cx - 4, cy - bh * 0.5, 2.6, bh)
-      g:fill_rect(cx + 1.4, cy - bh * 0.5, 2.6, bh)
-    else
-      set_rgb(g, pal.toolbar_text, 1.0)
-      local sz = max(3.5, min(5.5, r.h * 0.28))
-      local p = Path(cx - sz * 0.65, cy - sz)
-      p:line_to(cx + sz * 0.95, cy)
-      p:line_to(cx - sz * 0.65, cy + sz)
-      p:close()
-      g:fill_path(p)
-    end
+    draw_icon_pill(btns.play, self.playing, pal.note_fill, self.playing and "pause" or "play")
   end
 
   -- Stop button
   if btns.stop then
-    local r = btns.stop
-    draw_pill(r, false, nil, nil)
-    set_rgb(g, pal.toolbar_text, 0.92)
-    local sq = max(5, min(8, floor(r.h * 0.42)))
-    g:fill_rect(r.x + (r.w - sq) * 0.5, r.y + (r.h - sq) * 0.5, sq, sq)
+    draw_icon_pill(btns.stop, false, nil, "stop", pal.toolbar_text, 0.92)
   end
 
   -- Loop button
   if btns.loop then
-    draw_pill(btns.loop, self.loop_enabled, pal.loop_fill, "LOOP")
+    draw_icon_pill(btns.loop, self.loop_enabled, pal.loop_fill, "loop")
   end
 
-  -- BPM widget: [-] [BPM] [+]
+  -- BPM widget: [-] [BPM] [+] (numeric value stays crisp text)
   if btns.bpm then
     local r = btns.bpm
     local mw = (btns.bpm_minus and btns.bpm_minus.w) or 13
@@ -154,51 +146,56 @@ local function draw_toolbar(self, g, layout, pal)
     g:draw_text(bpm_str, r.x + r.w * 0.5, cy_txt, r.w - mw * 2, fs, CENTER_ALIGN)
   end
 
-  -- Grid division pill
+  -- Grid division pill (fraction label like 1/16 stays crisp text)
   if btns.grid then
     draw_pill(btns.grid, false, nil, Model.describe_grid(self))
   end
 
-  -- Snap toggle, Snap Mode pill & Note Length Mode pill
+  -- Snap toggle, Snap Mode, Note Length Mode & Shift+Drag Duplicate SVG toggles
   if btns.snap then
-    draw_pill(btns.snap, self.snap_enabled, pal.note_fill, "SNAP")
+    draw_icon_pill(btns.snap, self.snap_enabled, pal.note_fill, "snap")
   end
   if btns.snap_mode then
-    local sm_active = ((self.snap_mode or 1) == 4)
-    draw_pill(btns.snap_mode, sm_active, pal.loop_fill, Model.describe_snap_mode(self), pal.toolbar_muted)
+    local sm = self.snap_mode or 1
+    local sm_icons = { "snap_abs", "snap_rel", "snap_adp", "snap_vis" }
+    draw_icon_pill(btns.snap_mode, (sm == 4), pal.loop_fill, sm_icons[sm] or "snap_abs", pal.toolbar_muted)
   end
   if btns.len_mode then
-    local is_last = ((self.default_len_mode or 1) == 1)
-    draw_pill(btns.len_mode, is_last, pal.note_fill, Model.describe_len_mode(self), pal.toolbar_muted)
+    local lm = self.default_len_mode or 1
+    local lm_icon = (lm == 1) and "len_lst" or ((lm == 2) and "len_grd" or "len_fixed")
+    draw_icon_pill(btns.len_mode, (lm == 1), pal.note_fill, lm_icon, pal.toolbar_muted)
+  end
+  if btns.shift_dup then
+    draw_icon_pill(btns.shift_dup, (self.shift_drag_dup ~= false), pal.loop_fill, "shift_dup", pal.toolbar_muted)
   end
 
-  -- Undo / Redo / Cut / Copy / Paste action pills
+  -- Undo / Redo / Cut / Copy / Paste SVG pills
   local has_sel = (Model.count_selected(self) > 0)
   local has_cb  = Model.has_clipboard(self)
   if btns.undo then
     local ok = Model.can_undo(self)
-    draw_pill(btns.undo, false, nil, "UND", ok and pal.toolbar_text or pal.toolbar_muted, ok and 0.95 or 0.38)
+    draw_icon_pill(btns.undo, false, nil, "undo", ok and pal.toolbar_text or pal.toolbar_muted, ok and 0.96 or 0.36)
   end
   if btns.redo then
     local ok = Model.can_redo(self)
-    draw_pill(btns.redo, false, nil, "RDO", ok and pal.toolbar_text or pal.toolbar_muted, ok and 0.95 or 0.38)
+    draw_icon_pill(btns.redo, false, nil, "redo", ok and pal.toolbar_text or pal.toolbar_muted, ok and 0.96 or 0.36)
   end
   if btns.cut then
-    draw_pill(btns.cut, false, nil, "CUT", has_sel and pal.toolbar_text or pal.toolbar_muted, has_sel and 0.95 or 0.38)
+    draw_icon_pill(btns.cut, false, nil, "cut", has_sel and pal.toolbar_text or pal.toolbar_muted, has_sel and 0.96 or 0.36)
   end
   if btns.copy then
-    draw_pill(btns.copy, false, nil, "CPY", has_sel and pal.toolbar_text or pal.toolbar_muted, has_sel and 0.95 or 0.38)
+    draw_icon_pill(btns.copy, false, nil, "copy", has_sel and pal.toolbar_text or pal.toolbar_muted, has_sel and 0.96 or 0.36)
   end
   if btns.paste then
-    draw_pill(btns.paste, false, nil, "PST", has_cb and pal.toolbar_text or pal.toolbar_muted, has_cb and 0.95 or 0.38)
+    draw_icon_pill(btns.paste, false, nil, "paste", has_cb and pal.toolbar_text or pal.toolbar_muted, has_cb and 0.96 or 0.36)
   end
 
-  -- Fit & Clear
+  -- Fit & Clear SVG pills
   if btns.fit then
-    draw_pill(btns.fit, false, nil, "FIT")
+    draw_icon_pill(btns.fit, false, nil, "fit")
   end
   if btns.clr then
-    draw_pill(btns.clr, false, nil, "CLR")
+    draw_icon_pill(btns.clr, false, nil, "clr")
   end
 
   -- Status info text
@@ -474,16 +471,7 @@ local function draw_scrollbars_and_zoom(self, g, layout, pal)
     set_rgb(g, pal.border, 0.85)
     g:stroke_rect(cbl.x + 0.5, cbl.y + 0.5, cbl.w - 1, cbl.h - 1, 0.8)
 
-    local cy = cbl.y + cbl.h * 0.5
-    local ix = cbl.x + (cbl.w >= 36 and 10 or cbl.w * 0.5)
-    local sz = max(3, min(4.2, min(cbl.w, cbl.h) * 0.28))
-    set_rgb(g, pal.zoom_grip_fg, 0.92)
-    g:stroke_rect(ix - sz, cy - sz, sz * 2, sz * 2, 1.0)
-    g:fill_rect(ix - 1, cy - 1, 2, 2)
-    if cbl.w >= 36 then
-      local fs = max(7, min(9, cbl.h - 6))
-      g:draw_text("RST", cbl.x + 17 + (cbl.w - 17) * 0.5, cy, cbl.w - 18, fs, CENTER_ALIGN)
-    end
+    Icons.draw(g, "reset", cbl, pal.zoom_grip_fg, 0.95, 13)
   end
 
   -- Bottom Horizontal Scrollbar
@@ -923,11 +911,12 @@ function Render.paint_layer_3(self, g)
     if dmode == "move" and self.drag_orig_start and self.drag_orig_pitch then
       local db = pri.start_beat - self.drag_orig_start
       local dp = pri.pitch - self.drag_orig_pitch
+      local pfx = self.drag_is_dup and "DUP " or ""
       if abs(db) > 1e-4 or dp ~= 0 then
         local dp_str = (dp >= 0) and string.format("+%d", dp) or tostring(dp)
-        tag_str = string.format("%s  %+.2fb (%s st)", Model.pitch_name(pri.pitch), db, dp_str)
+        tag_str = string.format("%s%s  %+.2fb (%s st)", pfx, Model.pitch_name(pri.pitch), db, dp_str)
       else
-        tag_str = string.format("%s  %.2fb  %d sel", Model.pitch_name(pri.pitch), pri.start_beat, #targets)
+        tag_str = string.format("%s%s  %.2fb  %d sel", pfx, Model.pitch_name(pri.pitch), pri.start_beat, #targets)
       end
     elseif is_resizing then
       tag_str = string.format("Len %.2fb (%d sel)", pri.length, #targets)
@@ -992,7 +981,120 @@ function Render.paint_layer_3(self, g)
     g:draw_text(text, hx + hud_w * 0.5, hy + hud_h * 0.5, hud_w - 8, 10, CENTER_ALIGN)
   end
 
+  -- 5. Floating Hover Tooltip for SVG Icons & Chrome Controls (toggleable via show_tooltips)
+  if self.show_tooltips ~= false and not self.drag_mode then
+    local tip, tr = Render.get_hover_tooltip(self, layout)
+    if tip and tr and tr.w > 0 and tr.h > 0 then
+      -- Subtle hover ring around active icon/control
+      set_rgb(g, pal.hud_border, 0.82)
+      stroke_rrect(g, tr.x - 0.5, tr.y - 0.5, tr.w + 1, tr.h + 1, 4.5, 1.0)
+
+      local tip_w = min(w - 8, max(80, #tip * 5.8 + 16))
+      local tip_h = 18
+      local tx, ty
+      if self.hover_region == "corner_bl" then
+        tx = 4
+        ty = max(4, tr.y - tip_h - 5)
+      elseif self.hover_region == "vzoom" then
+        tx = max(4, w - tip_w - 4)
+        ty = max(4, tr.y - tip_h - 5)
+      elseif self.hover_region == "hzoom" then
+        tx = max(4, tr.x - tip_w - 5)
+        ty = max(4, min(h - tip_h - 4, tr.y + (tr.h - tip_h) * 0.5))
+      else
+        tx = max(4, min(w - tip_w - 4, tr.x + tr.w * 0.5 - tip_w * 0.5))
+        ty = layout.toolbar.y + layout.toolbar.h + 5
+        if ty + tip_h > h - 4 then
+          ty = max(4, tr.y - tip_h - 4)
+        end
+      end
+
+      set_rgb(g, pal.hud_bg, 0.94)
+      fill_rrect(g, tx, ty, tip_w, tip_h, 4)
+      set_rgb(g, pal.hud_border, 0.90)
+      stroke_rrect(g, tx, ty, tip_w, tip_h, 4, 0.9)
+      set_rgb(g, pal.hud_fg, 1.0)
+      g:draw_text(tip, tx + tip_w * 0.5, ty + tip_h * 0.5, tip_w - 10, 9.5, CENTER_ALIGN)
+    end
+  end
+
   local _ = h
+end
+
+function Render.get_hover_tooltip(self, layout)
+  local region = self.hover_region
+  if not region then return nil, nil end
+  layout = layout or Layout.compute(self)
+
+  if region == "btn" then
+    local b = self.hover_btn
+    local tr = b and layout.btns and layout.btns[b] or nil
+    if not tr then return nil, nil end
+    if b == "play" then
+      return (self.playing and "Pause Playback  [Space]" or "Play Sequence  [Space]"), tr
+    elseif b == "stop" then
+      return "Stop & Rewind Playhead", tr
+    elseif b == "loop" then
+      return "Loop Region: " .. (self.loop_enabled and "ON" or "OFF") .. " (Ruler: Ctrl+Drag / DblClick)", tr
+    elseif b == "bpm_minus" then
+      return "Decrease BPM (-1, Shift: -0.1)", tr
+    elseif b == "bpm_val" then
+      return string.format("Tempo: %.1f BPM (Drag U/D, DblClick=120)", self.bpm or 120.0), tr
+    elseif b == "bpm_plus" then
+      return "Increase BPM (+1, Shift: +0.1)", tr
+    elseif b == "grid" then
+      return "Grid Division: " .. Model.describe_grid(self) .. " (Click to cycle)", tr
+    elseif b == "snap" then
+      return "Grid Snap: " .. (self.snap_enabled and "ON" or "OFF"), tr
+    elseif b == "snap_mode" then
+      local sm = self.snap_mode or 1
+      local names = {
+        "Snap Mode: Absolute Grid (ABS)",
+        "Snap Mode: Relative Offset (REL)",
+        "Snap Mode: Adaptive Zoom (ADP)",
+        "Snap Mode: Visible Grid Lines (VIS)",
+      }
+      return names[sm] or "Snap Mode", tr
+    elseif b == "len_mode" then
+      local lm = self.default_len_mode or 1
+      if lm == 1 then
+        return "New Note Length: Last Note (Drag=Move)", tr
+      elseif lm == 2 then
+        return "New Note Length: Grid Step (Drag=Resize)", tr
+      else
+        return "New Note Length: Fixed " .. Model.describe_len_mode(self), tr
+      end
+    elseif b == "shift_dup" then
+      return "Shift+Drag Duplicate: " .. ((self.shift_drag_dup ~= false) and "ON (FL-Style Copy)" or "OFF"), tr
+    elseif b == "undo" then
+      return "Undo Last Edit  [Z / Alt+Z]", tr
+    elseif b == "redo" then
+      return "Redo Edit  [Shift+Z / Y]", tr
+    elseif b == "cut" then
+      return "Cut Selected Notes  [X / Ctrl+X]", tr
+    elseif b == "copy" then
+      return "Copy Selected Notes  [C / Ctrl+C]", tr
+    elseif b == "paste" then
+      return "Paste Notes at Playhead  [V / Ctrl+V]", tr
+    elseif b == "fit" then
+      return "Fit All Notes in View", tr
+    elseif b == "clr" then
+      return "Clear All Notes (Undoable)", tr
+    elseif b == "mod_ctrl" then
+      return "Ctrl Lock: Box Select / Ruler Loop Select", tr
+    elseif b == "mod_shift" then
+      return "Shift Lock: Drag Note=Duplicate / Blank=Zoom", tr
+    elseif b == "mod_alt" then
+      return "Alt Lock: Drag Canvas=Free Pan / Alt Hotkeys", tr
+    end
+  elseif region == "corner_bl" then
+    return "Reset Default Zoom & View Position", layout.corner_bl
+  elseif region == "hzoom" then
+    return "Horizontal Zoom: Drag L/R (DblClick=Reset)", layout.hzoom
+  elseif region == "vzoom" then
+    return "Vertical Zoom: Drag Up/Down (DblClick=Reset)", layout.vzoom
+  end
+  return nil, nil
 end
 
 return Render
