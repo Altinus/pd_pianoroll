@@ -1,0 +1,1457 @@
+-- ============================================================================
+-- pianoroll.pd_luajit — DAW-Grade MIDI Piano Roll Custom Object for plugdata
+--
+-- Features:
+--   * Layered NanoVG rendering (Layer 1 chrome/grid, Layer 2 loop/notes/keys,
+--     Layer 3 playhead/marquee/hover/HUD) with LuaJIT FFI voice tracking
+--   * Resize-invariant layout (object resize only changes roll viewport extent)
+--   * Plugdata theme-following + Dark/Light/Custom palettes & color properties
+--   * Bottom H-scrollbar + V-zoom grip (U/D); Right V-scrollbar + H-zoom grip (L/R)
+--   * Interactive ruler (click/drag seek, Ctrl+drag loop, double-click clear loop)
+--   * Full DAW gestures: blank click create, drag move, tail drag resize,
+--     double-click delete, plus external [keyname]->[pak f a] inlet:
+--       Ctrl+drag marquee, Shift+drag V/H zoom, Alt+drag free pan
+--   * Sorted active MIDI pitch list on Outlet 1 (cleared automatically on pause)
+-- ============================================================================
+
+-- Temporarily expose script directory to package.path for submodule require()
+-- so both plugdata runtime and offline pdlua-run.py harness resolve pr_*.lua.
+local _saved_pkg_path = package.path
+do
+  local dir = pd and rawget(pd, "_loadpath")
+  if type(dir) ~= "string" or dir == "" then
+    local info = debug and debug.getinfo and debug.getinfo(1, "S")
+    local src = info and info.source or ""
+    if src:sub(1, 1) == "@" then
+      src = src:sub(2)
+      local d = src:match("^(.*)[/\\][^/\\]+$")
+      if d and d ~= "" then
+        dir = d
+      end
+    end
+  end
+  if type(dir) == "string" and dir ~= "" then
+    package.path = dir .. "/?.lua;" .. dir .. "\\?.lua;" .. _saved_pkg_path
+  end
+end
+
+local Theme    = require("pr_theme")
+local Layout   = require("pr_layout")
+local Model    = require("pr_model")
+local Playback = require("pr_playback")
+local Render   = require("pr_render")
+local Input    = require("pr_input")
+
+package.path = _saved_pkg_path
+
+local floor = math.floor
+local max   = math.max
+local min   = math.min
+local table_unpack = table.unpack or rawget(_G, "unpack")
+
+local HDR_LEN = 51
+
+local function clamp(v, lo, hi)
+  if v < lo then return lo end
+  if v > hi then return hi end
+  return v
+end
+
+local function num_or(v, fallback)
+  local n = tonumber(v)
+  if n == nil then return fallback end
+  return n
+end
+
+local function bool_from_atom(v, fallback)
+  if v == nil then return fallback end
+  if type(v) == "boolean" then return v end
+  local n = tonumber(v)
+  if n ~= nil then return n ~= 0 end
+  local s = tostring(v):lower()
+  if s == "true" or s == "on" or s == "yes" then return true end
+  if s == "false" or s == "off" or s == "no" then return false end
+  return fallback
+end
+
+local function parse_color_arg(c, g, b, fallback)
+  if type(c) == "table" then
+    return Theme.clamp_rgb(c, fallback)
+  end
+  if type(c) == "number" then
+    return Theme.clamp_rgb({ c, tonumber(g) or c, tonumber(b) or c }, fallback)
+  end
+  return Theme.clamp_rgb(fallback, { 78, 201, 176 })
+end
+
+-- ============================================================================
+-- Class Definition
+-- ============================================================================
+
+local M = pd.class("pianoroll")
+
+function M:save_state()
+  local w, h = self:get_size()
+  local args = {
+    floor((w or Layout.DEF_W) + 0.5),
+    floor((h or Layout.DEF_H) + 0.5),
+    self.bpm or 120.0,
+    self.length_beats or 16.0,
+    self.timesig_num or 4,
+    self.grid_div_idx or 5,
+    self.snap_enabled and 1 or 0,
+    self.snap_mode or 1,
+    self.default_len_mode or 1,
+    self.default_vel or 100,
+    self.auto_rewind and 1 or 0,
+    self.preview_on_edit and 1 or 0,
+    self.preview_to_out1 and 1 or 0,
+    self.loop_enabled and 1 or 0,
+    (self.loop_start ~= nil and self.loop_end ~= nil and self.loop_end > self.loop_start) and 1 or 0,
+    self.loop_start or 0.0,
+    self.loop_end or 4.0,
+    self.px_per_beat or Layout.DEF_PPB,
+    self.px_per_pitch or Layout.DEF_PPP,
+    self.view_beat or 0.0,
+    self.view_pitch_top or 82.0,
+    self.toolbar_h or 28,
+    self.ruler_h or 20,
+    self.key_w or 48,
+    self.scroll_size or 16,
+    self.theme_mode or 1,
+    self.note_color[1], self.note_color[2], self.note_color[3],
+    self.selected_color[1], self.selected_color[2], self.selected_color[3],
+    self.playhead_color[1], self.playhead_color[2], self.playhead_color[3],
+    self.loop_color[1], self.loop_color[2], self.loop_color[3],
+    self.custom_bg_color[1], self.custom_bg_color[2], self.custom_bg_color[3],
+    self.show_toolbar and 1 or 0,
+    self.show_ruler and 1 or 0,
+    self.show_keyboard and 1 or 0,
+    self.show_scrollbars and 1 or 0,
+    self.show_note_names and 1 or 0,
+    self.show_playhead and 1 or 0,
+    self.highlight_rows and 1 or 0,
+    self.velocity_shade and 1 or 0,
+    self.tick_ms or 2,
+    self.redraw_ms or 33,
+    -2, -- v2 extension header sentinel (preserves v1 51-atom patch loading)
+    self.grid_color[1], self.grid_color[2], self.grid_color[3],
+    self.grid_contrast or 1.0,
+    -3, -- v3 extension header sentinel (preserves v1 & v2 patch loading)
+    (self.single_key_hotkeys ~= false) and 1 or 0,
+  }
+
+  local note_atoms = Model.serialize_notes(self)
+  for i = 1, #note_atoms do
+    args[#args + 1] = note_atoms[i]
+  end
+
+  self:set_args(args)
+end
+
+function M:flush_repaint()
+  local d1 = self._dirty_l1
+  local d2 = self._dirty_l2
+  local d3 = self._dirty_l3
+  if not (d1 or d2 or d3) then return end
+
+  local count = (d1 and 1 or 0) + (d2 and 1 or 0) + (d3 and 1 or 0)
+  local layer
+  if d1 or count >= 2 then
+    layer = 0
+  elseif d2 then
+    layer = 2
+  else
+    layer = 3
+  end
+
+  self._dirty_l1 = false
+  self._dirty_l2 = false
+  self._dirty_l3 = false
+
+  if rawget(pd, "_queue_repaint") ~= nil then
+    self:repaint(layer)
+  else
+    local fn_rep = rawget(pd, "_repaint")
+    if type(fn_rep) == "function" and self._object ~= nil then
+      fn_rep(self._object, layer)
+    end
+  end
+end
+
+function M:initialize(sel, atoms)
+  self.inlets  = 4
+  self.outlets = 4
+
+  -- Defaults
+  local init_w = Layout.DEF_W
+  local init_h = Layout.DEF_H
+
+  self.bpm              = 120.0
+  self.length_beats     = 16.0
+  self.timesig_num      = 4
+  self.grid_div_idx     = 5      -- 1/16
+  self.snap_enabled     = true
+  self.snap_mode        = 1      -- Absolute Grid
+  self.default_len_mode = 1      -- 1=Last Note (default), 2=Grid Step
+  self.default_vel      = 100
+  self.last_note_len    = 0.0    -- fallback to grid step until first note is touched/created
+  self.auto_rewind      = true
+  self.preview_on_edit  = true
+  self.preview_to_out1  = false
+
+  self.loop_enabled     = false
+  self.loop_start       = nil
+  self.loop_end         = nil
+
+  self.px_per_beat      = Layout.DEF_PPB
+  self.px_per_pitch     = Layout.DEF_PPP
+  self.view_beat        = 0.0
+  self.view_pitch_top   = 82.0
+
+  self.toolbar_h        = 28
+  self.ruler_h          = 20
+  self.key_w            = 48
+  self.scroll_size      = 16
+
+  self.theme_mode       = 1      -- 1=Auto(Plugdata), 2=Dark, 3=Light, 4=Custom
+  self.note_color       = { 78, 201, 176 }
+  self.selected_color   = { 255, 198, 92 }
+  self.playhead_color   = { 255, 92, 92 }
+  self.loop_color       = { 96, 175, 255 }
+  self.grid_color       = { 96, 102, 114 }
+  self.grid_contrast    = 1.0
+  self.custom_bg_color  = { 34, 36, 42 }
+
+  self.show_toolbar     = true
+  self.show_ruler       = true
+  self.show_keyboard    = true
+  self.show_scrollbars  = true
+  self.show_note_names  = true
+  self.show_playhead    = true
+  self.highlight_rows   = true
+  self.velocity_shade   = true
+
+  self.tick_ms          = 2
+  self.redraw_ms        = 33
+
+  self.playing          = false
+  self.playhead_beat    = 0.0
+  self.playhead_sec     = 0.0
+  self.last_systime     = pd.systime()
+
+  self.notes            = {}
+  self.next_id          = 1
+  self.max_end_beat     = 0.0
+  self.selected_ids     = {}
+  self.primary_sel_id   = nil
+  self.events           = {}
+  self.events_dirty     = true
+  self.event_cursor     = 1
+
+  self.keys_down        = {}
+  self.drag_mode        = nil
+  self.hud_text         = nil
+  self.hover_region     = nil
+  self.hover_btn        = nil
+  self.hover_note_id    = nil
+  self.hover_note_tail  = false
+  self.hover_pitch      = nil
+  self.single_key_hotkeys = true
+  self._mouse_inside      = false
+  self._pan_extra_beats   = 0.0
+  self.undo_stack         = {}
+  self.redo_stack         = {}
+
+  Model.init_voices(self)
+  Model.init_history(self)
+
+  -- Parse creation / persisted arguments
+  local n_atoms = atoms and #atoms or 0
+  if n_atoms >= 40 then
+    init_w                = clamp(floor(num_or(atoms[1], Layout.DEF_W) + 0.5), 160, 2400)
+    init_h                = clamp(floor(num_or(atoms[2], Layout.DEF_H) + 0.5), 120, 1600)
+    self.bpm              = clamp(num_or(atoms[3], 120.0), 20.0, 300.0)
+    self.length_beats     = clamp(num_or(atoms[4], 16.0), 1.0, 512.0)
+    self.timesig_num      = clamp(floor(num_or(atoms[5], 4) + 0.5), 1, 16)
+    self.grid_div_idx     = clamp(floor(num_or(atoms[6], 5) + 0.5), 1, #Model.GRID_DIVS)
+    self.snap_enabled     = (num_or(atoms[7], 1) ~= 0)
+    self.snap_mode        = clamp(floor(num_or(atoms[8], 1) + 0.5), 1, #Model.SNAP_MODES)
+    self.default_len_mode = clamp(floor(num_or(atoms[9], 1) + 0.5), 1, #Model.DEF_LEN_MODES)
+    self.default_vel      = clamp(floor(num_or(atoms[10], 100) + 0.5), 1, 127)
+    self.auto_rewind      = (num_or(atoms[11], 1) ~= 0)
+    self.preview_on_edit  = (num_or(atoms[12], 1) ~= 0)
+    self.preview_to_out1  = (num_or(atoms[13], 0) ~= 0)
+    self.loop_enabled     = (num_or(atoms[14], 0) ~= 0)
+    local has_loop        = (num_or(atoms[15], 0) ~= 0)
+    if has_loop then
+      local ls = max(0.0, num_or(atoms[16], 0.0))
+      local le = max(ls + 0.25, num_or(atoms[17], ls + 4.0))
+      self.loop_start = ls
+      self.loop_end   = le
+    end
+    self.px_per_beat      = clamp(num_or(atoms[18], Layout.DEF_PPB), Layout.MIN_PPB, Layout.MAX_PPB)
+    self.px_per_pitch     = clamp(num_or(atoms[19], Layout.DEF_PPP), Layout.MIN_PPP, Layout.MAX_PPP)
+    self.view_beat        = max(0.0, num_or(atoms[20], 0.0))
+    self.view_pitch_top   = clamp(num_or(atoms[21], 82.0), 0.0, 127.0)
+    self.toolbar_h        = clamp(floor(num_or(atoms[22], 28) + 0.5), 0, 48)
+    self.ruler_h          = clamp(floor(num_or(atoms[23], 20) + 0.5), 12, 36)
+    self.key_w            = clamp(floor(num_or(atoms[24], 48) + 0.5), 24, 96)
+    self.scroll_size      = clamp(floor(num_or(atoms[25], 16) + 0.5), 10, 28)
+    self.theme_mode       = clamp(floor(num_or(atoms[26], 1) + 0.5), 1, 4)
+
+    self.note_color       = Theme.clamp_rgb({ atoms[27], atoms[28], atoms[29] }, self.note_color)
+    self.selected_color   = Theme.clamp_rgb({ atoms[30], atoms[31], atoms[32] }, self.selected_color)
+    self.playhead_color   = Theme.clamp_rgb({ atoms[33], atoms[34], atoms[35] }, self.playhead_color)
+    self.loop_color       = Theme.clamp_rgb({ atoms[36], atoms[37], atoms[38] }, self.loop_color)
+    self.custom_bg_color  = Theme.clamp_rgb({ atoms[39], atoms[40], atoms[41] }, self.custom_bg_color)
+
+    self.show_toolbar     = (num_or(atoms[42], 1) ~= 0)
+    self.show_ruler       = (num_or(atoms[43], 1) ~= 0)
+    self.show_keyboard    = (num_or(atoms[44], 1) ~= 0)
+    self.show_scrollbars  = (num_or(atoms[45], 1) ~= 0)
+    self.show_note_names  = (num_or(atoms[46], 1) ~= 0)
+    self.show_playhead    = (num_or(atoms[47], 1) ~= 0)
+    self.highlight_rows   = (num_or(atoms[48], 1) ~= 0)
+    self.velocity_shade   = (num_or(atoms[49], 1) ~= 0)
+    self.tick_ms          = clamp(num_or(atoms[50], 2), 1, 20)
+    self.redraw_ms        = clamp(floor(num_or(atoms[51], 33) + 0.5), 16, 100)
+
+    local note_start = HDR_LEN + 1
+    if n_atoms >= HDR_LEN + 5 and num_or(atoms[HDR_LEN + 1], 0) == -2 then
+      self.grid_color    = Theme.clamp_rgb({ atoms[HDR_LEN + 2], atoms[HDR_LEN + 3], atoms[HDR_LEN + 4] }, self.grid_color)
+      self.grid_contrast = clamp(num_or(atoms[HDR_LEN + 5], 1.0), 0.25, 2.0)
+      note_start = HDR_LEN + 6
+      if n_atoms >= note_start + 1 and num_or(atoms[note_start], 0) == -3 then
+        self.single_key_hotkeys = (num_or(atoms[note_start + 1], 1) ~= 0)
+        note_start = note_start + 2
+      end
+    end
+
+    local i = note_start
+    while i + 3 <= n_atoms do
+      local np = tonumber(atoms[i])
+      local ns = tonumber(atoms[i + 1])
+      local nl = tonumber(atoms[i + 2])
+      local nv = tonumber(atoms[i + 3])
+      if np and ns and nl and nv then
+        Model.add_note(self, np, ns, nl, nv)
+      end
+      i = i + 4
+    end
+  elseif n_atoms >= 1 then
+    if type(atoms[1]) == "number" then
+      init_w = clamp(floor(atoms[1] + 0.5), 160, 2400)
+    end
+    if n_atoms >= 2 and type(atoms[2]) == "number" then
+      init_h = clamp(floor(atoms[2] + 0.5), 120, 1600)
+    end
+    if n_atoms >= 3 and type(atoms[3]) == "number" then
+      self.bpm = clamp(atoms[3], 20.0, 300.0)
+    end
+    if n_atoms >= 4 and type(atoms[4]) == "number" then
+      self.length_beats = clamp(atoms[4], 1.0, 512.0)
+    end
+    if n_atoms >= 5 and type(atoms[5]) == "number" then
+      self.timesig_num = clamp(floor(atoms[5] + 0.5), 1, 16)
+    end
+  end
+
+  self:set_size(init_w, init_h)
+  self._last_w = init_w
+  self._last_h = init_h
+  Layout.clamp_view(self)
+
+  self._dirty_l1 = true
+  self._dirty_l2 = true
+  self._dirty_l3 = true
+  return true
+end
+
+function M:postinitialize()
+  self.tick_clock   = pd.Clock:new():register(self, "on_tick")
+  self.redraw_clock = pd.Clock:new():register(self, "on_redraw")
+  self._ready       = true
+  self:flush_repaint()
+end
+
+function M:finalize()
+  Playback.all_voices_off(self)
+  if self.tick_clock then
+    self.tick_clock:unset()
+    self.tick_clock:destruct()
+    self.tick_clock = nil
+  end
+  if self.redraw_clock then
+    self.redraw_clock:unset()
+    self.redraw_clock:destruct()
+    self.redraw_clock = nil
+  end
+end
+
+function M:prereload()
+  Playback.all_voices_off(self)
+  if self.tick_clock then self.tick_clock:unset() end
+  if self.redraw_clock then self.redraw_clock:unset() end
+  local w, h = self:get_size()
+  return {
+    w = w, h = h,
+    notes = self.notes,
+    next_id = self.next_id,
+    max_end_beat = self.max_end_beat,
+    selected_ids = self.selected_ids,
+    primary_sel_id = self.primary_sel_id,
+    playhead_beat = self.playhead_beat,
+    bpm = self.bpm,
+    length_beats = self.length_beats,
+    timesig_num = self.timesig_num,
+    grid_div_idx = self.grid_div_idx,
+    snap_enabled = self.snap_enabled,
+    snap_mode = self.snap_mode,
+    default_len_mode = self.default_len_mode,
+    default_vel = self.default_vel,
+    last_note_len = self.last_note_len,
+    auto_rewind = self.auto_rewind,
+    preview_on_edit = self.preview_on_edit,
+    preview_to_out1 = self.preview_to_out1,
+    loop_enabled = self.loop_enabled,
+    loop_start = self.loop_start,
+    loop_end = self.loop_end,
+    px_per_beat = self.px_per_beat,
+    px_per_pitch = self.px_per_pitch,
+    view_beat = self.view_beat,
+    view_pitch_top = self.view_pitch_top,
+    toolbar_h = self.toolbar_h,
+    ruler_h = self.ruler_h,
+    key_w = self.key_w,
+    scroll_size = self.scroll_size,
+    theme_mode = self.theme_mode,
+    note_color = self.note_color,
+    selected_color = self.selected_color,
+    playhead_color = self.playhead_color,
+    loop_color = self.loop_color,
+    grid_color = self.grid_color,
+    grid_contrast = self.grid_contrast,
+    custom_bg_color = self.custom_bg_color,
+    show_toolbar = self.show_toolbar,
+    show_ruler = self.show_ruler,
+    show_keyboard = self.show_keyboard,
+    show_scrollbars = self.show_scrollbars,
+    show_note_names = self.show_note_names,
+    show_playhead = self.show_playhead,
+    highlight_rows = self.highlight_rows,
+    velocity_shade = self.velocity_shade,
+    tick_ms = self.tick_ms,
+    redraw_ms = self.redraw_ms,
+    single_key_hotkeys = self.single_key_hotkeys,
+    _pan_extra_beats = self._pan_extra_beats,
+    undo_stack = self.undo_stack,
+    redo_stack = self.redo_stack,
+  }
+end
+
+function M:postreload(state)
+  if type(state) == "table" then
+    for k, v in pairs(state) do
+      if k ~= "w" and k ~= "h" then
+        self[k] = v
+      end
+    end
+    if state.w and state.h then
+      self:set_size(state.w, state.h)
+      self._last_w = state.w
+      self._last_h = state.h
+    end
+    self.playing = false
+    self.events_dirty = true
+    Model.init_voices(self)
+    Model.rebuild_events(self)
+    Model.recompute_max_end(self)
+    Layout.clamp_view(self)
+  end
+  self._dirty_l1 = true
+  self._dirty_l2 = true
+  self._dirty_l3 = true
+  self:flush_repaint()
+end
+
+-- ============================================================================
+-- Clock Callbacks
+-- ============================================================================
+
+function M:on_tick()
+  Playback.on_tick(self)
+end
+
+function M:on_redraw()
+  if not self.playing then return end
+  self._dirty_l3 = true
+  self:flush_repaint()
+  if self.redraw_clock then
+    self.redraw_clock:delay(self.redraw_ms or 33)
+  end
+end
+
+-- ============================================================================
+-- 3-Layer NanoVG Rendering & Resize Invariance
+-- ============================================================================
+
+function M:paint(g)
+  local w, h = self:get_size()
+  if w ~= self._last_w or h ~= self._last_h then
+    self._last_w = w
+    self._last_h = h
+    Layout.clamp_view(self)
+    if self._ready then
+      self:save_state()
+    end
+  end
+  local ok, err = pcall(Render.paint_layer_1, self, g)
+  if not ok then
+    self:error("pianoroll paint L1: " .. tostring(err))
+  end
+end
+
+function M:paint_layer_2(g)
+  local ok, err = pcall(Render.paint_layer_2, self, g)
+  if not ok then
+    self:error("pianoroll paint L2: " .. tostring(err))
+  end
+end
+
+function M:paint_layer_3(g)
+  local ok, err = pcall(Render.paint_layer_3, self, g)
+  if not ok then
+    self:error("pianoroll paint L3: " .. tostring(err))
+  end
+end
+
+-- ============================================================================
+-- Mouse Events
+-- ============================================================================
+
+function M:mouse_down(x, y)
+  Input.mouse_down(self, x, y)
+end
+
+function M:mouse_drag(x, y)
+  Input.mouse_drag(self, x, y)
+end
+
+function M:mouse_up(x, y)
+  Input.mouse_up(self, x, y)
+end
+
+function M:mouse_enter(x, y)
+  Input.mouse_enter(self, x, y)
+end
+
+function M:mouse_move(x, y)
+  Input.mouse_move(self, x, y)
+end
+
+function M:mouse_exit(x, y)
+  Input.mouse_exit(self, x, y)
+end
+
+-- ============================================================================
+-- Helpers for Message Handling
+-- ============================================================================
+
+local function parse_grid_arg(val)
+  if type(val) == "number" then
+    local n = val
+    if n >= 1 and n <= #Model.GRID_DIVS and floor(n) == n then
+      return n
+    end
+    -- Also allow matching exact beat step (e.g. 0.5 -> 1/8, 0.25 -> 1/16)
+    local best_i, best_d = nil, 1e9
+    for i = 1, #Model.GRID_DIVS do
+      local gb = Model.GRID_DIVS[i].beats
+      if gb > 0 then
+        local d = math.abs(gb - n)
+        if d < 0.005 and d < best_d then
+          best_d = d
+          best_i = i
+        end
+      end
+    end
+    if best_i then return best_i end
+    return clamp(floor(n + 0.5), 1, #Model.GRID_DIVS)
+  end
+  local s = tostring(val)
+  for i = 1, #Model.GRID_DIVS do
+    if Model.GRID_DIVS[i].label == s then
+      return i
+    end
+  end
+  return nil
+end
+
+local function parse_snap_mode_arg(val)
+  if type(val) == "number" then
+    return clamp(floor(val + 0.5), 1, #Model.SNAP_MODES)
+  end
+  local s = tostring(val):lower()
+  if s:sub(1, 3) == "abs" then return 1 end
+  if s:sub(1, 3) == "rel" then return 2 end
+  if s:sub(1, 3) == "adp" or s:sub(1, 5) == "adapt" then return 3 end
+  if s:sub(1, 3) == "vis" or s:sub(1, 4) == "line" or s:sub(1, 4) == "grid" then return 4 end
+  for i = 1, #Model.SNAP_MODES do
+    if Model.SNAP_MODES[i].label:lower() == s or Model.SNAP_MODES[i].short:lower() == s then
+      return i
+    end
+  end
+  return nil
+end
+
+local function parse_len_mode_arg(val)
+  if type(val) == "number" then
+    return clamp(floor(val + 0.5), 1, #Model.DEF_LEN_MODES)
+  end
+  local s = tostring(val):lower()
+  if s:sub(1, 4) == "last" or s == "lst" then return 1 end
+  if s:sub(1, 4) == "grid" or s == "grd" then return 2 end
+  for i = 1, #Model.DEF_LEN_MODES do
+    if Model.DEF_LEN_MODES[i]:lower() == s then
+      return i
+    end
+  end
+  return nil
+end
+
+local function parse_theme_arg(val)
+  if type(val) == "number" then
+    return clamp(floor(val + 0.5), 1, 4)
+  end
+  local s = tostring(val):lower()
+  if s == "auto" or s == "plugdata" then return 1 end
+  if s == "dark" then return 2 end
+  if s == "light" then return 3 end
+  if s == "custom" then return 4 end
+  return nil
+end
+
+-- ============================================================================
+-- Inlet 1: Control, Editing, Transport, Pattern & Query Protocol
+-- ============================================================================
+
+function M:in_1(sel, atoms)
+  if sel == "bang" then
+    if self.playing then Playback.pause(self) else Playback.start(self) end
+    return
+  elseif sel == "float" then
+    Playback.seek_beat(self, atoms[1] or 0)
+    return
+  elseif sel == "play" or sel == "start" then
+    if atoms[1] ~= nil and tonumber(atoms[1]) == 0 then
+      Playback.pause(self)
+    else
+      Playback.start(self)
+    end
+    return
+  elseif sel == "pause" then
+    Playback.pause(self)
+    return
+  elseif sel == "stop" then
+    Playback.stop(self)
+    return
+  elseif sel == "toggle" then
+    if self.playing then Playback.pause(self) else Playback.start(self) end
+    return
+  elseif sel == "reset" or sel == "rewind" then
+    Playback.seek_beat(self, 0.0)
+    return
+  elseif sel == "seek" or sel == "pos" then
+    Playback.seek_beat(self, num_or(atoms[1], 0.0))
+    return
+  elseif sel == "seek_sec" then
+    local b = num_or(atoms[1], 0.0) * ((self.bpm or 120.0) / 60.0)
+    Playback.seek_beat(self, b)
+    return
+  elseif sel == "bpm" or sel == "tempo" then
+    Playback.set_bpm(self, atoms[1])
+    self:save_state()
+    self._dirty_l1 = true
+    self:flush_repaint()
+    return
+  elseif sel == "grid" or sel == "quant" then
+    local idx = parse_grid_arg(atoms[1])
+    if idx then
+      self.grid_div_idx = idx
+      self:save_state()
+      self._dirty_l1 = true
+      self:flush_repaint()
+    end
+    return
+  elseif sel == "snap" then
+    self.snap_enabled = bool_from_atom(atoms[1], not self.snap_enabled)
+    self:save_state()
+    self._dirty_l1 = true
+    self:flush_repaint()
+    return
+  elseif sel == "snap_mode" then
+    local m = parse_snap_mode_arg(atoms[1])
+    if m then
+      self.snap_mode = m
+      self:save_state()
+      self._dirty_l1 = true
+      self:flush_repaint()
+    end
+    return
+  elseif sel == "len_mode" then
+    local m = parse_len_mode_arg(atoms[1])
+    if m then
+      self.default_len_mode = m
+      self:save_state()
+      self._dirty_l1 = true
+      self:flush_repaint()
+    end
+    return
+  elseif sel == "length" then
+    self.length_beats = clamp(num_or(atoms[1], 16.0), 1.0, 512.0)
+    Layout.clamp_view(self)
+    self:save_state()
+    self._dirty_l1 = true
+    self._dirty_l2 = true
+    self._dirty_l3 = true
+    self:flush_repaint()
+    return
+  elseif sel == "bars" then
+    local bars = clamp(num_or(atoms[1], 4), 1, 128)
+    self.length_beats = clamp(bars * max(1, self.timesig_num or 4), 1.0, 512.0)
+    Layout.clamp_view(self)
+    self:save_state()
+    self._dirty_l1 = true
+    self._dirty_l2 = true
+    self._dirty_l3 = true
+    self:flush_repaint()
+    return
+  elseif sel == "timesig" then
+    self.timesig_num = clamp(floor(num_or(atoms[1], 4) + 0.5), 1, 16)
+    self:save_state()
+    self._dirty_l1 = true
+    self:flush_repaint()
+    return
+  elseif sel == "vel" or sel == "velocity" then
+    self.default_vel = clamp(floor(num_or(atoms[1], 100) + 0.5), 1, 127)
+    self:save_state()
+    return
+  elseif sel == "loop" then
+    local n = #atoms
+    if n == 0 then
+      self.loop_enabled = not self.loop_enabled
+      if self.loop_enabled and (not self.loop_start or not self.loop_end or self.loop_end <= self.loop_start) then
+        self.loop_start = 0.0
+        self.loop_end   = max(1.0, min(self.length_beats or 16, self.timesig_num or 4))
+      end
+    elseif n == 1 then
+      local en = bool_from_atom(atoms[1], false)
+      self.loop_enabled = en
+      if en and (not self.loop_start or not self.loop_end or self.loop_end <= self.loop_start) then
+        self.loop_start = 0.0
+        self.loop_end   = max(1.0, min(self.length_beats or 16, self.timesig_num or 4))
+      end
+    elseif n == 2 then
+      local a = max(0.0, num_or(atoms[1], 0.0))
+      local b = max(a + 0.0625, num_or(atoms[2], a + 4.0))
+      self.loop_start   = a
+      self.loop_end     = b
+      self.loop_enabled = true
+    else
+      local en = bool_from_atom(atoms[1], true)
+      local a  = max(0.0, num_or(atoms[2], 0.0))
+      local b  = max(a + 0.0625, num_or(atoms[3], a + 4.0))
+      self.loop_enabled = en
+      self.loop_start   = a
+      self.loop_end     = b
+    end
+    Playback.emit_loop(self)
+    self:save_state()
+    self._dirty_l1 = true
+    self._dirty_l2 = true
+    self._dirty_l3 = true
+    self:flush_repaint()
+    return
+  elseif sel == "clear_loop" or sel == "loop_clear" then
+    self.loop_enabled = false
+    self.loop_start   = nil
+    self.loop_end     = nil
+    Playback.emit_loop(self)
+    self:save_state()
+    self._dirty_l1 = true
+    self._dirty_l2 = true
+    self._dirty_l3 = true
+    self:flush_repaint()
+    return
+  elseif sel == "add" or sel == "note" or (sel == "list" and #atoms >= 3) then
+    local p = num_or(atoms[1], nil)
+    local s = num_or(atoms[2], nil)
+    local l = num_or(atoms[3], Model.get_default_note_length(self))
+    local v = num_or(atoms[4], self.default_vel or 100)
+    if p and s then
+      local pre = Model.capture_snapshot(self)
+      local note = Model.add_note(self, p, s, l, v)
+      Model.push_undo(self, pre)
+      Playback.sync_note_modified(self, note)
+      self:outlet(4, "edited", { "add", note.pitch, note.start_beat, note.length, note.velocity })
+      self:save_state()
+      Layout.clamp_view(self)
+      self._dirty_l1 = true
+      self._dirty_l2 = true
+      self._dirty_l3 = true
+      self:flush_repaint()
+    end
+    return
+  elseif sel == "list" and #atoms == 1 and type(atoms[1]) == "number" then
+    Playback.seek_beat(self, atoms[1])
+    return
+  elseif sel == "set_notes" then
+    Playback.release_playback_voices(self)
+    if self.playing then Playback.emit_empty_list(self) end
+    Model.push_undo(self)
+    Model.clear_notes(self)
+    local i = 1
+    while i + 2 <= #atoms do
+      local p = tonumber(atoms[i])
+      local s = tonumber(atoms[i + 1])
+      local l = tonumber(atoms[i + 2])
+      local v = tonumber(atoms[i + 3])
+      if not v then
+        v = self.default_vel or 100
+        i = i + 3
+      else
+        i = i + 4
+      end
+      if p and s and l then
+        Model.add_note(self, p, s, l, v)
+      end
+    end
+    Model.rebuild_events(self)
+    if self.playing then
+      Playback.seek_beat(self, self.playhead_beat or 0.0)
+    end
+    self:outlet(4, "edited", { "set_notes", #self.notes })
+    self:save_state()
+    Layout.clamp_view(self)
+    self._dirty_l1 = true
+    self._dirty_l2 = true
+    self._dirty_l3 = true
+    self:flush_repaint()
+    return
+  elseif sel == "remove" then
+    if #atoms == 1 then
+      local id = num_or(atoms[1], nil)
+      local note = id and Model.find_note_by_id(self, id) or nil
+      if note then
+        Model.push_undo(self)
+        Model.remove_note(self, note)
+        Playback.sync_note_removed(self, note)
+        self:outlet(4, "edited", { "delete", note.id })
+        self:save_state()
+        self._dirty_l1 = true
+        self._dirty_l2 = true
+        self._dirty_l3 = true
+        self:flush_repaint()
+      end
+    elseif #atoms >= 2 then
+      local p = floor(num_or(atoms[1], -1) + 0.5)
+      local s = num_or(atoms[2], -1)
+      local eps = num_or(atoms[3], 0.01)
+      for idx = #self.notes, 1, -1 do
+        local n = self.notes[idx]
+        if n.pitch == p and math.abs(n.start_beat - s) <= eps then
+          Model.push_undo(self)
+          Model.remove_note(self, n)
+          Playback.sync_note_removed(self, n)
+          self:outlet(4, "edited", { "delete", n.id })
+          self:save_state()
+          self._dirty_l1 = true
+          self._dirty_l2 = true
+          self._dirty_l3 = true
+          self:flush_repaint()
+          break
+        end
+      end
+    end
+    return
+  elseif sel == "delete_selected" then
+    if Model.count_selected(self) > 0 then
+      local pre = Model.capture_snapshot(self)
+      local removed = Model.remove_selected(self)
+      if #removed > 0 then
+        Model.push_undo(self, pre)
+        for i = 1, #removed do
+          Playback.sync_note_removed(self, removed[i])
+        end
+        self:outlet(4, "edited", { "delete", #removed })
+        self:save_state()
+        self._dirty_l1 = true
+        self._dirty_l2 = true
+        self._dirty_l3 = true
+        self:flush_repaint()
+      end
+    end
+    return
+  elseif sel == "clear" then
+    Playback.all_voices_off(self)
+    if self.playing then
+      Playback.emit_empty_list(self)
+    end
+    if #self.notes > 0 then
+      Model.push_undo(self)
+    end
+    Model.clear_notes(self)
+    self:outlet(4, "edited", { "clear" })
+    self:save_state()
+    Layout.clamp_view(self)
+    self._dirty_l1 = true
+    self._dirty_l2 = true
+    self._dirty_l3 = true
+    self:flush_repaint()
+    return
+  elseif sel == "transpose" then
+    local st = floor(num_or(atoms[1], 0) + 0.5)
+    local pre = Model.capture_snapshot(self)
+    if Model.transpose_selected(self, st) then
+      Model.push_undo(self, pre)
+      local sel_notes = Model.get_selected_notes(self)
+      for i = 1, #sel_notes do
+        Playback.sync_note_modified(self, sel_notes[i])
+      end
+      self:outlet(4, "edited", { "transpose", st })
+      self:save_state()
+      self._dirty_l2 = true
+      self._dirty_l3 = true
+      self:flush_repaint()
+    end
+    return
+  elseif sel == "quantize" then
+    local str = num_or(atoms[1], 1.0)
+    local pre = Model.capture_snapshot(self)
+    if Model.quantize_notes(self, str) then
+      Model.push_undo(self, pre)
+      if self.playing then
+        Playback.seek_beat(self, self.playhead_beat or 0.0)
+      end
+      self:outlet(4, "edited", { "quantize", str })
+      self:save_state()
+      self._dirty_l2 = true
+      self._dirty_l3 = true
+      self:flush_repaint()
+    end
+    return
+  elseif sel == "undo" then
+    Input.action_undo(self)
+    return
+  elseif sel == "redo" then
+    Input.action_redo(self)
+    return
+  elseif sel == "copy" then
+    Input.action_copy(self)
+    return
+  elseif sel == "cut" then
+    Input.action_cut(self)
+    return
+  elseif sel == "paste" then
+    Input.action_paste(self, num_or(atoms[1], nil))
+    return
+  elseif sel == "duplicate" or sel == "dup" then
+    Input.action_duplicate(self)
+    return
+  elseif sel == "hotkeys" or sel == "single_key_hotkeys" then
+    self.single_key_hotkeys = bool_from_atom(atoms[1], true)
+    self:save_state()
+    return
+  elseif sel == "select_all" then
+    Model.select_all(self)
+    self._ctrl_selected = (#self.notes > 0)
+    self._dirty_l1 = true
+    self._dirty_l2 = true
+    self:flush_repaint()
+    return
+  elseif sel == "deselect" then
+    Model.clear_selection(self)
+    self._ctrl_selected = false
+    self._dirty_l1 = true
+    self._dirty_l2 = true
+    self:flush_repaint()
+    return
+  elseif sel == "get_notes" or sel == "dump" then
+    local count = #self.notes
+    self:outlet(4, "dump_begin", { count })
+    for i = 1, count do
+      local n = self.notes[i]
+      self:outlet(4, "note", { n.pitch, n.start_beat, n.length, n.velocity, n.id })
+    end
+    self:outlet(4, "dump_end", { count })
+    return
+  elseif sel == "get_active" then
+    Playback.emit_active_list(self)
+    return
+  elseif sel == "get_state" then
+    self:outlet(4, "state", {
+      self.length_beats or 16,
+      Model.GRID_LABELS[self.grid_div_idx or 5] or "1/16",
+      self.snap_enabled and 1 or 0,
+      self.snap_mode or 1,
+      #self.notes,
+    })
+    Playback.emit_loop(self)
+    self:outlet(3, "bpm", { self.bpm or 120 })
+    Playback.emit_pos(self)
+    self:outlet(3, "playing", { self.playing and 1 or 0 })
+    return
+  elseif sel == "note_color" then
+    self.note_color = parse_color_arg(atoms[1], atoms[2], atoms[3], self.note_color)
+    self:save_state()
+    self._dirty_l1 = true
+    self._dirty_l2 = true
+    self:flush_repaint()
+    return
+  elseif sel == "selected_color" then
+    self.selected_color = parse_color_arg(atoms[1], atoms[2], atoms[3], self.selected_color)
+    self:save_state()
+    self._dirty_l2 = true
+    self:flush_repaint()
+    return
+  elseif sel == "playhead_color" then
+    self.playhead_color = parse_color_arg(atoms[1], atoms[2], atoms[3], self.playhead_color)
+    self:save_state()
+    self._dirty_l3 = true
+    self:flush_repaint()
+    return
+  elseif sel == "loop_color" then
+    self.loop_color = parse_color_arg(atoms[1], atoms[2], atoms[3], self.loop_color)
+    self:save_state()
+    self._dirty_l1 = true
+    self._dirty_l2 = true
+    self:flush_repaint()
+    return
+  elseif sel == "grid_color" then
+    self.grid_color = parse_color_arg(atoms[1], atoms[2], atoms[3], self.grid_color)
+    self:save_state()
+    self._dirty_l1 = true
+    self:flush_repaint()
+    return
+  elseif sel == "grid_contrast" then
+    self.grid_contrast = clamp(num_or(atoms[1], 1.0), 0.25, 2.0)
+    self:save_state()
+    self._dirty_l1 = true
+    self:flush_repaint()
+    return
+  elseif sel == "custom_bg_color" then
+    self.custom_bg_color = parse_color_arg(atoms[1], atoms[2], atoms[3], self.custom_bg_color)
+    self:save_state()
+    self._dirty_l1 = true
+    self._dirty_l2 = true
+    self._dirty_l3 = true
+    self:flush_repaint()
+    return
+  elseif sel == "theme" then
+    local m = parse_theme_arg(atoms[1])
+    if m then
+      self.theme_mode = m
+      self:save_state()
+      self._dirty_l1 = true
+      self._dirty_l2 = true
+      self._dirty_l3 = true
+      self:flush_repaint()
+    end
+    return
+  elseif sel == "resize" then
+    local cw, ch = self:get_size()
+    local nw = clamp(floor(num_or(atoms[1], cw) + 0.5), 160, 2400)
+    local nh = clamp(floor(num_or(atoms[2], ch) + 0.5), 120, 1600)
+    self:set_size(nw, nh)
+    self._last_w = nw
+    self._last_h = nh
+    Layout.clamp_view(self)
+    self:save_state()
+    self._dirty_l1 = true
+    self._dirty_l2 = true
+    self._dirty_l3 = true
+    self:flush_repaint()
+    return
+  elseif sel == "fit" then
+    Input.fit_view(self)
+    self:save_state()
+    return
+  elseif sel == "reset_view" then
+    Input.reset_default_view(self)
+    self:save_state()
+    return
+  elseif sel == "key" then
+    Input.on_key_list(self, atoms)
+    return
+  elseif sel == "reset_keys" then
+    Input.reset_keys(self)
+    return
+  end
+end
+
+-- ============================================================================
+-- Inlet 2: BPM Control
+-- ============================================================================
+
+function M:in_2(sel, atoms)
+  if sel == "float" or sel == "bpm" or sel == "tempo" then
+    Playback.set_bpm(self, atoms[1])
+    self:save_state()
+    self._dirty_l1 = true
+    self:flush_repaint()
+  elseif sel == "bang" then
+    self:outlet(3, "bpm", { self.bpm or 120 })
+  end
+end
+
+-- ============================================================================
+-- Inlet 3: View, Scroll & Zoom Control
+-- ============================================================================
+
+function M:in_3(sel, atoms)
+  if sel == "float" or sel == "goto" then
+    self.view_beat = max(0.0, num_or(atoms[1], 0.0))
+    Layout.clamp_view(self)
+    self._dirty_l1 = true
+    self._dirty_l2 = true
+    self._dirty_l3 = true
+    self:flush_repaint()
+  elseif sel == "scroll" or sel == "view" then
+    if atoms[1] ~= nil then self.view_beat = max(0.0, num_or(atoms[1], self.view_beat)) end
+    if atoms[2] ~= nil then self.view_pitch_top = clamp(num_or(atoms[2], self.view_pitch_top), 0.0, 127.0) end
+    Layout.clamp_view(self)
+    self._dirty_l1 = true
+    self._dirty_l2 = true
+    self._dirty_l3 = true
+    self:flush_repaint()
+  elseif sel == "zoom" or sel == "hzoom" then
+    self.px_per_beat = clamp(num_or(atoms[1], self.px_per_beat), Layout.MIN_PPB, Layout.MAX_PPB)
+    Layout.clamp_view(self)
+    self:save_state()
+    self._dirty_l1 = true
+    self._dirty_l2 = true
+    self._dirty_l3 = true
+    self:flush_repaint()
+  elseif sel == "vzoom" then
+    self.px_per_pitch = clamp(num_or(atoms[1], self.px_per_pitch), Layout.MIN_PPP, Layout.MAX_PPP)
+    Layout.clamp_view(self)
+    self:save_state()
+    self._dirty_l1 = true
+    self._dirty_l2 = true
+    self._dirty_l3 = true
+    self:flush_repaint()
+  elseif sel == "goto_pitch" then
+    local layout = Layout.compute(self)
+    local p = clamp(num_or(atoms[1], 60), 0, 127)
+    local vis = layout.roll.h / (self.px_per_pitch or Layout.DEF_PPP)
+    self.view_pitch_top = p + vis * 0.5
+    Layout.clamp_view(self, layout)
+    self._dirty_l1 = true
+    self._dirty_l2 = true
+    self._dirty_l3 = true
+    self:flush_repaint()
+  elseif sel == "fit" then
+    Input.fit_view(self)
+    self:save_state()
+  end
+end
+
+-- ============================================================================
+-- Inlet 4: External Keyname Input [1/0 KEYNAME] from [keyname]->[pak f a]
+-- ============================================================================
+
+function M:in_4(sel, atoms)
+  if sel == "list" or sel == "key" then
+    Input.on_key_list(self, atoms)
+  elseif sel == "reset_keys" or sel == "reset" or sel == "clear" then
+    Input.reset_keys(self)
+  elseif sel == "mods" then
+    self:outlet(4, "mods", {
+      Input.is_ctrl(self) and 1 or 0,
+      Input.is_shift(self) and 1 or 0,
+      Input.is_alt(self) and 1 or 0,
+    })
+  elseif atoms and #atoms >= 1 and type(atoms[1]) == "number" and type(sel) == "string" then
+    -- Fallback if user routed symbol-first [Control_L 1(
+    Input.on_key_list(self, { atoms[1], sel })
+  end
+end
+
+-- ============================================================================
+-- Properties Inspector & Live Setter Callbacks
+-- ============================================================================
+
+function M:properties(p)
+  local w, h = self:get_size()
+
+  p:new_frame("Layout & Size", 2)
+  p:add_int("Width",            "prop_width",       floor(w + 0.5), 160, 2400)
+  p:add_int("Height",           "prop_height",      floor(h + 0.5), 120, 1600)
+  p:add_int("Toolbar Height",   "prop_toolbar_h",   self.toolbar_h or 28, 0, 48)
+  p:add_int("Ruler Height",     "prop_ruler_h",     self.ruler_h or 20, 12, 36)
+  p:add_int("Keyboard Width",   "prop_key_w",       self.key_w or 48, 24, 96)
+  p:add_int("Scrollbar Size",   "prop_scroll_size", self.scroll_size or 16, 10, 28)
+
+  p:new_frame("Transport & Grid", 2)
+  p:add_float("BPM",            "prop_bpm",          self.bpm or 120.0, 20.0, 300.0)
+  p:add_float("Length (Beats)", "prop_length_beats", self.length_beats or 16.0, 1.0, 512.0)
+  p:add_int("Beats / Bar",      "prop_timesig_num",  self.timesig_num or 4, 1, 16)
+  p:add_combo("Grid Division",  "prop_grid_div",     self.grid_div_idx or 5, Model.GRID_LABELS)
+  p:add_check("Snap Enabled",   "prop_snap_enabled", self.snap_enabled and 1 or 0)
+  p:add_combo("Snap Mode",      "prop_snap_mode",    self.snap_mode or 1, Model.SNAP_MODE_LABELS)
+  p:add_check("Auto Rewind",    "prop_auto_rewind",  self.auto_rewind and 1 or 0)
+  p:add_check("Loop Enabled",   "prop_loop_enabled", self.loop_enabled and 1 or 0)
+
+  p:new_frame("MIDI & Editing", 2)
+  p:add_combo("Default Length",   "prop_def_len_mode", self.default_len_mode or 1, Model.DEF_LEN_MODES)
+  p:add_int("Default Velocity",   "prop_default_vel",  self.default_vel or 100, 1, 127)
+  p:add_check("Audition on Edit", "prop_preview_edit", self.preview_on_edit and 1 or 0)
+  p:add_check("Preview to Out 1", "prop_preview_out1", self.preview_to_out1 and 1 or 0)
+  p:add_check("Hover Hotkeys (Z/C/X/V)", "prop_single_hotkeys", (self.single_key_hotkeys ~= false) and 1 or 0)
+  p:add_float("Horiz Zoom",       "prop_px_per_beat",  self.px_per_beat or Layout.DEF_PPB, Layout.MIN_PPB, Layout.MAX_PPB)
+  p:add_float("Vert Zoom",        "prop_px_per_pitch", self.px_per_pitch or Layout.DEF_PPP, Layout.MIN_PPP, Layout.MAX_PPP)
+
+  p:new_frame("Appearance & Colors", 2)
+  p:add_combo("Theme Mode",       "prop_theme_mode",      self.theme_mode or 1, { "Auto (Plugdata)", "Dark Studio", "Light Studio", "Custom" })
+  p:add_float("Grid Contrast",    "prop_grid_contrast",   self.grid_contrast or 1.0, 0.25, 2.0)
+  p:add_color("Note Color",       "prop_note_color",      self.note_color)
+  p:add_color("Selected Color",   "prop_selected_color",  self.selected_color)
+  p:add_color("Playhead Color",   "prop_playhead_color",  self.playhead_color)
+  p:add_color("Loop Color",       "prop_loop_color",      self.loop_color)
+  p:add_color("Grid Line Color",  "prop_grid_color",      self.grid_color)
+  p:add_color("Custom Background","prop_custom_bg_color", self.custom_bg_color)
+
+  p:new_frame("Display Options", 2)
+  p:add_check("Show Toolbar",     "prop_show_toolbar",    self.show_toolbar and 1 or 0)
+  p:add_check("Show Ruler",       "prop_show_ruler",      self.show_ruler and 1 or 0)
+  p:add_check("Show Keyboard",    "prop_show_keyboard",   self.show_keyboard and 1 or 0)
+  p:add_check("Show Scrollbars",  "prop_show_scrollbars", self.show_scrollbars and 1 or 0)
+  p:add_check("Show Note Names",  "prop_show_note_names", self.show_note_names and 1 or 0)
+  p:add_check("Show Playhead",    "prop_show_playhead",   self.show_playhead and 1 or 0)
+  p:add_check("Highlight Rows",   "prop_highlight_rows",  self.highlight_rows and 1 or 0)
+  p:add_check("Velocity Shading", "prop_velocity_shade",  self.velocity_shade and 1 or 0)
+  p:add_int("UI Redraw (ms)",     "prop_redraw_ms",       self.redraw_ms or 33, 16, 100)
+end
+
+local function refresh_all(self)
+  Layout.clamp_view(self)
+  self:save_state()
+  self._dirty_l1 = true
+  self._dirty_l2 = true
+  self._dirty_l3 = true
+  self:flush_repaint()
+end
+
+function M:prop_width(v)
+  local _, ch = self:get_size()
+  local nw = clamp(floor(num_or(v, Layout.DEF_W) + 0.5), 160, 2400)
+  self:set_size(nw, ch)
+  self._last_w = nw
+  refresh_all(self)
+end
+
+function M:prop_height(v)
+  local cw, _ = self:get_size()
+  local nh = clamp(floor(num_or(v, Layout.DEF_H) + 0.5), 120, 1600)
+  self:set_size(cw, nh)
+  self._last_h = nh
+  refresh_all(self)
+end
+
+function M:prop_toolbar_h(v)
+  self.toolbar_h = clamp(floor(num_or(v, 28) + 0.5), 0, 48)
+  refresh_all(self)
+end
+
+function M:prop_ruler_h(v)
+  self.ruler_h = clamp(floor(num_or(v, 20) + 0.5), 12, 36)
+  refresh_all(self)
+end
+
+function M:prop_key_w(v)
+  self.key_w = clamp(floor(num_or(v, 48) + 0.5), 24, 96)
+  refresh_all(self)
+end
+
+function M:prop_scroll_size(v)
+  self.scroll_size = clamp(floor(num_or(v, 16) + 0.5), 10, 28)
+  refresh_all(self)
+end
+
+function M:prop_bpm(v)
+  Playback.set_bpm(self, v)
+  self:save_state()
+  self._dirty_l1 = true
+  self:flush_repaint()
+end
+
+function M:prop_length_beats(v)
+  self.length_beats = clamp(num_or(v, 16.0), 1.0, 512.0)
+  refresh_all(self)
+end
+
+function M:prop_timesig_num(v)
+  self.timesig_num = clamp(floor(num_or(v, 4) + 0.5), 1, 16)
+  refresh_all(self)
+end
+
+function M:prop_grid_div(v)
+  self.grid_div_idx = clamp(floor(num_or(v, 5) + 0.5), 1, #Model.GRID_DIVS)
+  refresh_all(self)
+end
+
+function M:prop_snap_enabled(v)
+  self.snap_enabled = bool_from_atom(v, true)
+  self:save_state()
+  self._dirty_l1 = true
+  self:flush_repaint()
+end
+
+function M:prop_snap_mode(v)
+  self.snap_mode = clamp(floor(num_or(v, 1) + 0.5), 1, #Model.SNAP_MODES)
+  self:save_state()
+  self._dirty_l1 = true
+  self:flush_repaint()
+end
+
+function M:prop_auto_rewind(v)
+  self.auto_rewind = bool_from_atom(v, true)
+  self:save_state()
+end
+
+function M:prop_loop_enabled(v)
+  local en = bool_from_atom(v, false)
+  self.loop_enabled = en
+  if en and (not self.loop_start or not self.loop_end or self.loop_end <= self.loop_start) then
+    self.loop_start = 0.0
+    self.loop_end   = max(1.0, min(self.length_beats or 16, self.timesig_num or 4))
+  end
+  Playback.emit_loop(self)
+  refresh_all(self)
+end
+
+function M:prop_def_len_mode(v)
+  self.default_len_mode = clamp(floor(num_or(v, 1) + 0.5), 1, #Model.DEF_LEN_MODES)
+  self:save_state()
+  self._dirty_l1 = true
+  self:flush_repaint()
+end
+
+function M:prop_default_vel(v)
+  self.default_vel = clamp(floor(num_or(v, 100) + 0.5), 1, 127)
+  self:save_state()
+end
+
+function M:prop_preview_edit(v)
+  self.preview_on_edit = bool_from_atom(v, true)
+  self:save_state()
+end
+
+function M:prop_preview_out1(v)
+  self.preview_to_out1 = bool_from_atom(v, false)
+  self:save_state()
+end
+
+function M:prop_px_per_beat(v)
+  self.px_per_beat = clamp(num_or(v, Layout.DEF_PPB), Layout.MIN_PPB, Layout.MAX_PPB)
+  refresh_all(self)
+end
+
+function M:prop_px_per_pitch(v)
+  self.px_per_pitch = clamp(num_or(v, Layout.DEF_PPP), Layout.MIN_PPP, Layout.MAX_PPP)
+  refresh_all(self)
+end
+
+function M:prop_theme_mode(v)
+  self.theme_mode = clamp(floor(num_or(v, 1) + 0.5), 1, 4)
+  refresh_all(self)
+end
+
+function M:prop_note_color(c, g, b)
+  self.note_color = parse_color_arg(c, g, b, self.note_color)
+  refresh_all(self)
+end
+
+function M:prop_selected_color(c, g, b)
+  self.selected_color = parse_color_arg(c, g, b, self.selected_color)
+  refresh_all(self)
+end
+
+function M:prop_playhead_color(c, g, b)
+  self.playhead_color = parse_color_arg(c, g, b, self.playhead_color)
+  refresh_all(self)
+end
+
+function M:prop_loop_color(c, g, b)
+  self.loop_color = parse_color_arg(c, g, b, self.loop_color)
+  refresh_all(self)
+end
+
+function M:prop_grid_color(c, g, b)
+  self.grid_color = parse_color_arg(c, g, b, self.grid_color)
+  refresh_all(self)
+end
+
+function M:prop_grid_contrast(v)
+  self.grid_contrast = clamp(num_or(v, 1.0), 0.25, 2.0)
+  refresh_all(self)
+end
+
+function M:prop_custom_bg_color(c, g, b)
+  self.custom_bg_color = parse_color_arg(c, g, b, self.custom_bg_color)
+  refresh_all(self)
+end
+
+function M:prop_show_toolbar(v)
+  self.show_toolbar = bool_from_atom(v, true)
+  refresh_all(self)
+end
+
+function M:prop_show_ruler(v)
+  self.show_ruler = bool_from_atom(v, true)
+  refresh_all(self)
+end
+
+function M:prop_show_keyboard(v)
+  self.show_keyboard = bool_from_atom(v, true)
+  refresh_all(self)
+end
+
+function M:prop_show_scrollbars(v)
+  self.show_scrollbars = bool_from_atom(v, true)
+  refresh_all(self)
+end
+
+function M:prop_show_note_names(v)
+  self.show_note_names = bool_from_atom(v, true)
+  refresh_all(self)
+end
+
+function M:prop_show_playhead(v)
+  self.show_playhead = bool_from_atom(v, true)
+  refresh_all(self)
+end
+
+function M:prop_highlight_rows(v)
+  self.highlight_rows = bool_from_atom(v, true)
+  refresh_all(self)
+end
+
+function M:prop_velocity_shade(v)
+  self.velocity_shade = bool_from_atom(v, true)
+  refresh_all(self)
+end
+
+function M:prop_redraw_ms(v)
+  self.redraw_ms = clamp(floor(num_or(v, 33) + 0.5), 16, 100)
+  self:save_state()
+end
+
+function M:prop_single_hotkeys(v)
+  self.single_key_hotkeys = bool_from_atom(v, true)
+  self:save_state()
+end
+
+local _unused = table_unpack
+local _min = min
