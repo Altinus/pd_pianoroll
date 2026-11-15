@@ -71,6 +71,10 @@ local function send_msg(inlet, sel, ...)
   harness.send(inlet, sel, atoms)
 end
 
+-- Verify fresh instance starts in Loop mode (auto shortest-bar loop until custom set)
+assert(obj.loop_enabled == true, "fresh instance defaults to Loop Enabled ON")
+assert(obj.return_to_start == true, "fresh instance defaults to Space Return-to-Start ON")
+
 -- ----------------------------------------------------------------------------
 -- Test 1: Blank click create, drag move, tail drag resize, double-click delete
 -- ----------------------------------------------------------------------------
@@ -248,11 +252,14 @@ assert(obj.playhead_beat >= obj.loop_start and obj.playhead_beat < obj.loop_end,
        "playhead wrapped cleanly inside [loop_start, loop_end)")
 send_msg(1, "stop")
 
--- Double-click on ruler deletes loop setting
+-- Double-click on ruler clears custom loop range back to Auto-Loop
 click(r_x2, r_mid_y)
 click(r_x2, r_mid_y)
-assert(obj.loop_enabled == false and obj.loop_start == nil and obj.loop_end == nil,
-       "ruler double-click cleared loop setting completely")
+assert(obj.loop_enabled == true and obj.loop_start == nil and obj.loop_end == nil,
+       "ruler double-click cleared custom loop range back to Auto-Loop")
+local eff4_on, eff4_a, eff4_b, eff4_auto = Model.get_effective_loop(obj)
+assert(eff4_on and eff4_auto and eff4_a == 0.0 and math.abs(eff4_b - 4.0) < 0.001,
+       "cleared custom range reverted to shortest-bar Auto-Loop [0..4]")
 
 -- ----------------------------------------------------------------------------
 -- Test 5: Scrollbars, Swapped Corner Controls (Reset & V-Zoom), Keyboard
@@ -1045,20 +1052,23 @@ harness.assert_near(obj.bpm, 128, 0.001, "prop_bpm updated bpm")
 obj:prop_show_tooltips(0)
 obj:prop_shift_drag_dup(0)
 obj:prop_follow_playhead(0)
+obj:prop_return_to_start(0)
 obj:save_state()
 local fn_get_args = obj.get_args
 if type(fn_get_args) == "function" then
   local saved_args = fn_get_args(obj)
   assert(saved_args and saved_args[52] == -2 and saved_args[57] == -3 and saved_args[59] == -4
-         and saved_args[62] == -5 and #saved_args > 63,
-         "save_state persisted v2/v3/v4/v5 headers + notes in args")
+         and saved_args[62] == -5 and saved_args[64] == -6 and #saved_args > 65,
+         "save_state persisted v2/v3/v4/v5/v6 headers + notes in args")
   harness.assert_eq(saved_args[60], 0, "show_tooltips=false persisted under -4 header")
   harness.assert_eq(saved_args[61], 0, "shift_drag_dup=false persisted under -4 header")
   harness.assert_eq(saved_args[63], 0, "follow_playhead=false persisted under -5 header")
+  harness.assert_eq(saved_args[65], 0, "return_to_start=false persisted under -6 header")
 end
 obj:prop_show_tooltips(1)
 obj:prop_shift_drag_dup(1)
 obj:prop_follow_playhead(1)
+obj:prop_return_to_start(1)
 
 -- ----------------------------------------------------------------------------
 -- Test 21: Follow Playhead auto-scroll, loop wrap snap & toolbar/inlet toggles
@@ -1066,6 +1076,7 @@ obj:prop_follow_playhead(1)
 ;(function()
   send_msg(1, "stop")
   send_msg(1, "clear_loop")
+  send_msg(1, "loop", 0)
   send_msg(1, "length", 32)
   send_msg(1, "bpm", 120)
   send_msg(1, "follow", 1)
@@ -1099,6 +1110,7 @@ obj:prop_follow_playhead(1)
   click(bf.x + bf.w * 0.5, bf.y + bf.h * 0.5)
   assert(obj.follow_playhead == false, "toolbar click toggled follow_playhead OFF")
   send_msg(1, "clear_loop")
+  send_msg(1, "loop", 0)
   send_msg(3, "scroll", 0.0, 78)
   send_msg(1, "seek", 3.5)
   harness.advance(1000) -- playhead reaches ~5.5 (offscreen right)
@@ -1112,6 +1124,7 @@ obj:prop_follow_playhead(1)
          "enabling follow during playback immediately snapped view to playhead")
 
   send_msg(1, "stop")
+  send_msg(1, "loop", 1)
   send_msg(1, "length", 16)
   send_msg(1, "reset_view")
 end)()
@@ -1303,7 +1316,301 @@ end)()
 
   os.remove(multi_path)
   os.remove(multi_rt_path)
+end)()
 
+-- ----------------------------------------------------------------------------
+-- Test 24: Return-to-Play-Start (Space) vs Stop & Rewind to 0
+-- ----------------------------------------------------------------------------
+;(function()
+  send_msg(1, "clear")
+  send_msg(1, "bpm", 120)
+  send_msg(1, "length", 16)
+  send_msg(1, "loop", 1, 1.0, 5.0)
+  send_msg(1, "return_to_start", 1)
+  send_msg(1, "set_notes", 60, 2.0, 2.0, 100)
+  assert(obj.return_to_start == true, "return_to_start active")
+
+  -- Seek to 2.0, press Space to start, advance, press Space to return to 2.0
+  send_msg(1, "seek", 2.0)
+  send_msg(4, "list", 1, "space")
+  send_msg(4, "list", 0, "space")
+  assert(obj.playing == true, "Space started playback")
+  harness.assert_near(obj.last_play_start_beat, 2.0, 0.01, "recorded last_play_start_beat == 2.0")
+  harness.advance(600) -- +1.2 beats -> ~3.2
+  assert(obj.playhead_beat > 2.9, "playhead advanced during playback")
+  send_msg(4, "list", 1, "space")
+  send_msg(4, "list", 0, "space")
+  assert(obj.playing == false, "second Space stopped playback")
+  harness.assert_near(obj.playhead_beat, 2.0, 0.01, "Space returned playhead to last start beat 2.0")
+
+  -- Toolbar Play button obeys Space toggle_space; Stop button ALWAYS rewinds to 0.0
+  local lay24 = Layout.compute(obj)
+  local bplay = lay24.btns and lay24.btns.play
+  local bstop = lay24.btns and lay24.btns.stop
+  local bret  = lay24.btns and lay24.btns.ret_start
+  assert(bplay and bstop and bret, "toolbar play/stop/ret_start buttons present")
+  click(bplay.x + bplay.w * 0.5, bplay.y + bplay.h * 0.5)
+  assert(obj.playing == true, "toolbar Play started playback")
+  harness.advance(350)
+  click(bplay.x + bplay.w * 0.5, bplay.y + bplay.h * 0.5)
+  assert(obj.playing == false, "toolbar Play stopped playback")
+  harness.assert_near(obj.playhead_beat, 2.0, 0.01, "toolbar Play returned to start beat 2.0")
+
+  send_msg(4, "list", 1, "space")
+  send_msg(4, "list", 0, "space")
+  harness.advance(400)
+  click(bstop.x + bstop.w * 0.5, bstop.y + bstop.h * 0.5)
+  assert(obj.playing == false, "toolbar Stop stopped playback")
+  harness.assert_near(obj.playhead_beat, 0.0, 0.01, "Stop & Rewind returned playhead to beat 0.0")
+  harness.assert_near(obj.last_play_start_beat, 0.0, 0.01, "Stop & Rewind reset last_play_start_beat to 0.0")
+
+  -- Toggling ret_start OFF makes Space pause in place
+  click(bret.x + bret.w * 0.5, bret.y + bret.h * 0.5)
+  assert(obj.return_to_start == false, "toolbar ret_start toggle turned return_to_start OFF")
+  send_msg(1, "seek", 1.5)
+  send_msg(4, "list", 1, "space")
+  send_msg(4, "list", 0, "space")
+  harness.advance(500) -- ~2.5
+  send_msg(4, "list", 1, "space")
+  send_msg(4, "list", 0, "space")
+  assert(obj.playing == false and obj.playhead_beat > 2.2, "with ret_start OFF, Space paused in place")
+
+  -- Restore ON via toolbar button
+  click(bret.x + bret.w * 0.5, bret.y + bret.h * 0.5)
+  assert(obj.return_to_start == true, "toolbar ret_start restored return_to_start ON")
+end)()
+
+-- ----------------------------------------------------------------------------
+-- Test 25: Alt+Drag Note Edge Unsnapped Resize (Without Triggering Canvas Pan)
+-- ----------------------------------------------------------------------------
+;(function()
+  send_msg(1, "stop")
+  send_msg(1, "clear")
+  send_msg(1, "bpm", 120)
+  send_msg(1, "snap", 1)
+  send_msg(1, "grid", "1/4") -- 1.0 beat step
+  send_msg(1, "snap_mode", 1)
+  send_msg(3, "hzoom", 120)
+  send_msg(3, "scroll", 0.0, 68.0)
+  send_msg(1, "set_notes", 60, 1.0, 1.0, 100)
+
+  local lay25 = Layout.compute(obj)
+  local yn = Layout.pitch_to_py(obj, lay25, 60) + obj.px_per_pitch * 0.5
+  local x_tail = Layout.beat_to_px(obj, lay25, 2.0) - 2
+  local vb0 = obj.view_beat
+
+  -- Hold Alt before clicking tail edge -> enters resize, not pan
+  send_msg(4, "list", 1, "Alt_L")
+  obj:mouse_down(x_tail, yn)
+  harness.assert_eq(obj.drag_mode, "resize", "Alt+mouse_down on note tail entered resize mode")
+  local x_free = Layout.beat_to_px(obj, lay25, 2.37)
+  obj:mouse_drag(x_free, yn)
+  obj:mouse_up(x_free, yn)
+  send_msg(4, "list", 0, "Alt_L")
+  harness.assert_near(obj.notes[1].length, 1.37, 0.03, "Alt+drag tail resized note freely without snap")
+  harness.assert_near(obj.view_beat, vb0, 0.001, "Alt+drag tail did not pan view")
+
+  -- Hold Alt mid-drag after starting resize normally -> dynamically disables snap
+  local x_tail2 = Layout.beat_to_px(obj, lay25, 2.37) - 2
+  obj:mouse_down(x_tail2, yn)
+  harness.assert_eq(obj.drag_mode, "resize", "normal tail mouse_down entered resize")
+  obj:mouse_drag(Layout.beat_to_px(obj, lay25, 2.5), yn)
+  send_msg(4, "list", 1, "Alt_L")
+  local x_free2 = Layout.beat_to_px(obj, lay25, 2.63)
+  obj:mouse_drag(x_free2, yn)
+  obj:mouse_up(x_free2, yn)
+  send_msg(4, "list", 0, "Alt_L")
+  harness.assert_near(obj.notes[1].length, 1.63, 0.03, "pressing Alt mid-resize disabled grid snap")
+
+  -- Normal tail resize without Alt snaps back cleanly to 1/4 grid (beat 3.0 -> len 2.0)
+  local x_tail3 = Layout.beat_to_px(obj, lay25, 2.63) - 2
+  drag(x_tail3, yn, Layout.beat_to_px(obj, lay25, 3.12), yn, 4)
+  harness.assert_near(obj.notes[1].length, 2.0, 0.02, "normal tail resize snapped cleanly to beat 3.0")
+
+  -- Alt + blank space still pans normally
+  local y_blank = Layout.pitch_to_py(obj, lay25, 65) + obj.px_per_pitch * 0.5
+  send_msg(4, "list", 1, "Alt_L")
+  obj:mouse_down(Layout.beat_to_px(obj, lay25, 2.0), y_blank)
+  harness.assert_eq(obj.drag_mode, "pan", "Alt+mouse_down on blank roll still enters pan mode")
+  obj:mouse_drag(Layout.beat_to_px(obj, lay25, 1.5), y_blank)
+  obj:mouse_up(Layout.beat_to_px(obj, lay25, 1.5), y_blank)
+  send_msg(4, "list", 0, "Alt_L")
+  assert(obj.view_beat > vb0, "Alt+drag on blank roll panned view")
+  send_msg(3, "scroll", 0.0, 68.0)
+end)()
+
+-- ----------------------------------------------------------------------------
+-- Test 26: Ctrl+Up / Ctrl+Down Octave Transpose (Selected Notes Only)
+-- ----------------------------------------------------------------------------
+;(function()
+  send_msg(1, "set_notes", 48, 0.0, 1.0, 90, 60, 1.0, 1.0, 100, 64, 1.0, 1.0, 100)
+  Model.select_only(obj, obj.notes[2].id)
+  Model.toggle_select(obj, obj.notes[3].id)
+
+  -- Ctrl+Up (+12)
+  send_msg(4, "list", 1, "Control_L")
+  send_msg(4, "list", 1, "Up")
+  send_msg(4, "list", 0, "Up")
+  send_msg(4, "list", 0, "Control_L")
+  harness.assert_eq(obj.notes[1].pitch, 48, "Ctrl+Up left unselected note untouched")
+  harness.assert_eq(obj.notes[2].pitch, 72, "Ctrl+Up raised selected note 1 by +12")
+  harness.assert_eq(obj.notes[3].pitch, 76, "Ctrl+Up raised selected note 2 by +12")
+
+  -- Ctrl+ArrowDown (-12)
+  send_msg(4, "list", 1, "Control_L")
+  send_msg(4, "list", 1, "ArrowDown")
+  send_msg(4, "list", 0, "ArrowDown")
+  send_msg(4, "list", 0, "Control_L")
+  harness.assert_eq(obj.notes[2].pitch, 60, "Ctrl+ArrowDown lowered selected note 1 by -12")
+  harness.assert_eq(obj.notes[3].pitch, 64, "Ctrl+ArrowDown lowered selected note 2 by -12")
+
+  -- Undo / Redo integration
+  send_msg(1, "undo")
+  harness.assert_eq(obj.notes[2].pitch, 72, "Undo reverted Ctrl+ArrowDown")
+  send_msg(1, "redo")
+  harness.assert_eq(obj.notes[2].pitch, 60, "Redo reapplied Ctrl+ArrowDown")
+
+  -- Upper & lower MIDI boundary guard (refuse rather than collapsing chord intervals)
+  send_msg(1, "set_notes", 114, 0.0, 1.0, 100, 120, 1.0, 1.0, 100)
+  send_msg(1, "select_all")
+  send_msg(4, "list", 1, "Control_L")
+  send_msg(4, "list", 1, "Up")
+  send_msg(4, "list", 0, "Up")
+  send_msg(4, "list", 0, "Control_L")
+  harness.assert_eq(obj.notes[1].pitch, 114, "Ctrl+Up near 127 preserved chord interval (did not partial-clamp)")
+  harness.assert_eq(obj.notes[2].pitch, 120, "Ctrl+Up refused when octave exceeds 127")
+
+  send_msg(1, "set_notes", 5, 0.0, 1.0, 100, 11, 1.0, 1.0, 100)
+  send_msg(1, "select_all")
+  send_msg(4, "list", 1, "Control_L")
+  send_msg(4, "list", 1, "Down")
+  send_msg(4, "list", 0, "Down")
+  send_msg(4, "list", 0, "Control_L")
+  harness.assert_eq(obj.notes[1].pitch, 5, "Ctrl+Down refused when octave drops below 0")
+  harness.assert_eq(obj.notes[2].pitch, 11, "Ctrl+Down preserved lower interval")
+end)()
+
+-- ----------------------------------------------------------------------------
+-- Test 27: Multi-Selected Notes Right-Edge <-> Time Stretch Handle (Snapped & Alt-Free)
+-- ----------------------------------------------------------------------------
+;(function()
+  send_msg(3, "hzoom", 120)
+  send_msg(3, "vzoom", 16)
+  send_msg(3, "scroll", 0.0, 72.0)
+  send_msg(1, "snap", 1)
+  send_msg(1, "grid", "1/4") -- 1.0 beat step
+  send_msg(1, "snap_mode", 1)
+  send_msg(1, "set_notes", 60, 1.0, 0.5, 100, 64, 2.0, 1.0, 100, 72, 0.0, 0.5, 90)
+
+  -- Single note selected -> stretch handle hidden
+  Model.select_only(obj, obj.notes[1].id)
+  local lay27 = Layout.compute(obj)
+  assert(Layout.get_stretch_handle_rect(obj, lay27) == nil, "stretch handle hidden for single note")
+
+  -- Two selected notes (anchor=1.0, span=2.0 -> end=3.0); note 3 unselected
+  Model.toggle_select(obj, obj.notes[2].id)
+  local sh = Layout.get_stretch_handle_rect(obj, lay27)
+  assert(sh ~= nil and sh.count == 2 and sh.x >= sh.x_right,
+         "stretch handle visible to the right of multi-selection bounding box")
+
+  -- Default snapped drag right to beat 5.14 -> snaps to 5.0 (2.0x stretch anchored at 1.0)
+  local sx0, sy0 = sh.x + sh.w * 0.5, sh.y + sh.h * 0.5
+  local sx1 = Layout.beat_to_px(obj, lay27, 5.14)
+  obj:mouse_down(sx0, sy0)
+  harness.assert_eq(obj.drag_mode, "stretch", "clicking <-> handle entered stretch mode")
+  obj:mouse_drag(sx1, sy0)
+  obj:mouse_up(sx1, sy0)
+  harness.assert_near(obj.notes[1].start_beat, 1.0, 0.01, "stretch kept leftmost anchor start at 1.0")
+  harness.assert_near(obj.notes[1].length, 1.0, 0.02, "snapped 2x stretch doubled note 1 length to 1.0")
+  harness.assert_near(obj.notes[2].start_beat, 3.0, 0.02, "snapped 2x stretch scaled note 2 start to 3.0")
+  harness.assert_near(obj.notes[2].length, 2.0, 0.02, "snapped 2x stretch doubled note 2 length to 2.0")
+  harness.assert_near(obj.notes[3].start_beat, 0.0, 0.001, "unselected note unaffected by stretch")
+
+  -- Alt + drag stretch handle -> free unsnapped scaling to beat 4.37
+  local sh2 = Layout.get_stretch_handle_rect(obj, Layout.compute(obj))
+  assert(sh2 ~= nil, "stretch handle remains available after stretch")
+  send_msg(4, "list", 1, "Alt_L")
+  local ax0, ay0 = sh2.x + sh2.w * 0.5, sh2.y + sh2.h * 0.5
+  local ax1 = ax0 + (4.37 - 5.0) * obj.px_per_beat
+  obj:mouse_down(ax0, ay0)
+  harness.assert_eq(obj.drag_mode, "stretch", "Alt+mouse_down on <-> handle still enters stretch")
+  obj:mouse_drag(ax1, ay0)
+  obj:mouse_up(ax1, ay0)
+  send_msg(4, "list", 0, "Alt_L")
+  local end2 = obj.notes[2].start_beat + obj.notes[2].length
+  harness.assert_near(end2, 4.37, 0.04, "Alt+drag stretched freely without snapping to beat 4.37")
+
+  -- 1-step Undo/Redo verification
+  send_msg(1, "undo")
+  harness.assert_near(obj.notes[2].length, 2.0, 0.02, "Undo reverted Alt+stretch back to 2x snapped result")
+  send_msg(1, "undo")
+  harness.assert_near(obj.notes[2].start_beat, 2.0, 0.01, "second Undo restored original start=2.0")
+  harness.assert_near(obj.notes[1].length, 0.5, 0.01, "second Undo restored original length=0.5")
+  send_msg(1, "redo")
+  harness.assert_near(obj.notes[2].length, 2.0, 0.02, "Redo reapplied snapped 2x stretch cleanly")
+end)()
+
+-- ----------------------------------------------------------------------------
+-- Test 28: Default Loop ON & Dynamic Shortest-Bar Auto-Loop + MIDI Import Reset
+-- ----------------------------------------------------------------------------
+;(function()
+  send_msg(1, "stop")
+  send_msg(1, "clear")
+  send_msg(1, "clear_loop")
+  send_msg(1, "loop", 1)
+  send_msg(1, "timesig", 4)
+  send_msg(1, "length", 32)
+  send_msg(1, "bpm", 120)
+
+  -- Empty notes -> 1 bar (4 beats in 4/4)
+  local on0, a0, b0, auto0 = Model.get_effective_loop(obj)
+  assert(on0 and auto0 and a0 == 0.0, "empty project defaults to Auto-Loop ON from beat 0")
+  harness.assert_near(b0, 4.0, 0.001, "empty Auto-Loop spans minimum 1 bar (4.0)")
+
+  -- Note ending at 5.25 -> shortest whole bar = 2 bars (8.0)
+  send_msg(1, "set_notes", 60, 4.5, 0.75, 100)
+  harness.assert_near(Model.get_auto_loop_end(obj), 8.0, 0.001, "5.25 beats in 4/4 auto-loops at 8.0")
+
+  -- Note ending exactly at 8.0 stays at 8.0
+  send_msg(1, "add", 64, 7.0, 1.0, 100)
+  harness.assert_near(Model.get_auto_loop_end(obj), 8.0, 0.001, "exact beat 8.0 stays on 2 bars (8.0)")
+
+  -- Note crossing 8.05 bumps to 3 bars (12.0)
+  send_msg(1, "add", 67, 7.5, 0.55, 100)
+  harness.assert_near(Model.get_auto_loop_end(obj), 12.0, 0.001, "8.05 beats bumps Auto-Loop to 3 bars (12.0)")
+
+  -- Changing time signature to 3/4 updates Auto-Loop dynamically to 9.0 (3 * 3)
+  send_msg(1, "timesig", 3)
+  harness.assert_near(Model.get_auto_loop_end(obj), 9.0, 0.001, "3/4 time signature adjusts Auto-Loop to 9.0")
+
+  -- Playback wraps cleanly inside dynamic Auto-Loop [0.0, 9.0)
+  send_msg(1, "seek", 8.8)
+  send_msg(1, "play")
+  harness.advance(300) -- +0.6 beats -> 9.4 wraps to 0.4
+  assert(obj.playhead_beat >= 0.0 and obj.playhead_beat < 1.0,
+         "playback wrapped dynamically at Auto-Loop end 9.0 -> 0.x")
+  send_msg(1, "stop")
+
+  -- Importing MIDI clears stale custom range back to Auto-Loop covering imported MIDI
+  send_msg(1, "timesig", 4)
+  send_msg(1, "loop", 1, 1.0, 3.0)
+  assert(Model.has_custom_loop(obj) == true, "custom loop [1..3] active before MIDI import")
+  local auto_mid = "_tmp_auto_loop_test.mid"
+  local smf_bytes = Midi.encode({
+    { pitch = 60, start_beat = 0.0, length = 1.0, velocity = 100 },
+    { pitch = 67, start_beat = 5.0, length = 1.0, velocity = 100 }, -- ends at 6.0 -> 8.0 auto-loop
+  }, { bpm = 120, ppq = 480 })
+  local wok = Midi.write_bytes(auto_mid, smf_bytes)
+  assert(wok == true, "wrote temporary auto-loop MIDI fixture")
+  send_msg(1, "import_midi", auto_mid)
+  os.remove(auto_mid)
+  assert(obj.loop_enabled == true and Model.has_custom_loop(obj) == false,
+         "import_midi cleared stale custom loop back to dynamic Auto-Loop")
+  harness.assert_near(Model.get_auto_loop_end(obj), 8.0, 0.001,
+                      "imported 6-beat MIDI auto-loops cleanly at 2 bars (8.0)")
+end)()
+
+;(function()
   -- Restore clean preview chord fixture for --paint preview.svg
   send_msg(1, "bpm", 128)
   send_msg(1, "timesig", 4)
@@ -1317,9 +1624,12 @@ end)()
   }
   harness.send(1, "set_notes", preview_notes)
   local _ = unpack_fn
+  send_msg(1, "clear_loop")
+  send_msg(1, "loop", 1)
   send_msg(1, "fit")
   send_msg(1, "seek", 1.25)
-  Model.select_only(obj, obj.notes[7].id)
+  Model.select_only(obj, obj.notes[6].id)
+  Model.toggle_select(obj, obj.notes[7].id)
   obj.hud_text = "Default Zoom & Pos"
 end)()
 

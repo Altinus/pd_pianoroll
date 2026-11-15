@@ -116,12 +116,15 @@ local function draw_toolbar(self, g, layout, pal)
     draw_icon_pill(btns.stop, false, nil, "stop", pal.toolbar_text, 0.92)
   end
 
-  -- Loop & Follow Playhead buttons
+  -- Loop, Follow Playhead & Space Return-to-Start buttons
   if btns.loop then
     draw_icon_pill(btns.loop, self.loop_enabled, pal.loop_fill, "loop")
   end
   if btns.follow then
     draw_icon_pill(btns.follow, (self.follow_playhead ~= false), pal.note_fill, "follow", pal.toolbar_muted)
+  end
+  if btns.ret_start then
+    draw_icon_pill(btns.ret_start, (self.return_to_start ~= false), pal.note_fill, "ret_start", pal.toolbar_muted)
   end
 
   -- BPM widget: [-] [BPM] [+] (numeric value stays crisp text)
@@ -590,26 +593,34 @@ function Render.paint_layer_2(self, g)
   local vb   = self.view_beat
   local top_p = self.view_pitch_top
 
-  -- 1. Loop region overlay (on ruler + subtle tint on roll)
-  if self.loop_start ~= nil and self.loop_end ~= nil and self.loop_end > self.loop_start then
-    local lx1 = Layout.beat_to_px(self, layout, self.loop_start)
-    local lx2 = Layout.beat_to_px(self, layout, self.loop_end)
+  -- 1. Loop region overlay (custom explicit range OR dynamic shortest-bar auto-loop)
+  local eff_active, eff_ls, eff_le, is_auto_loop = Model.get_effective_loop(self)
+  local draw_loop = eff_active or Model.has_custom_loop(self)
+  if draw_loop then
+    local ls = eff_active and eff_ls or self.loop_start
+    local le = eff_active and eff_le or self.loop_end
+    local lx1 = Layout.beat_to_px(self, layout, ls)
+    local lx2 = Layout.beat_to_px(self, layout, le)
     local enabled = self.loop_enabled
+    local fill_a_rl   = enabled and (is_auto_loop and 0.16 or 0.30) or 0.12
+    local bar_a_rl    = enabled and (is_auto_loop and 0.72 or 0.95) or 0.40
+    local fill_a_roll = enabled and (is_auto_loop and 0.035 or 0.08) or 0.03
+    local edge_a_roll = enabled and (is_auto_loop and 0.42 or 0.55) or 0.22
 
     if rl.h > 0 then
       local cx, cy, cw, ch = clip_rect(lx1, rl.y + 1, lx2 - lx1, max(4, rl.h - 2), rl.x, rl.y, rl.w, rl.h)
       if cx then
-        set_rgb(g, pal.loop_fill, enabled and 0.30 or 0.12)
+        set_rgb(g, pal.loop_fill, fill_a_rl)
         g:fill_rect(cx, cy, cw, ch)
-        set_rgb(g, pal.loop_border, enabled and 0.95 or 0.40)
-        g:fill_rect(cx, rl.y + 1, cw, 3)
+        set_rgb(g, pal.loop_border, bar_a_rl)
+        g:fill_rect(cx, rl.y + 1, cw, is_auto_loop and 2 or 3)
       end
       if lx1 >= rl.x and lx1 <= rl.x + rl.w then
-        set_rgb(g, pal.loop_border, enabled and 0.95 or 0.45)
+        set_rgb(g, pal.loop_border, bar_a_rl)
         g:draw_line(lx1, rl.y + 1, lx1, rl.y + rl.h, 1.5)
       end
       if lx2 >= rl.x and lx2 <= rl.x + rl.w then
-        set_rgb(g, pal.loop_border, enabled and 0.95 or 0.45)
+        set_rgb(g, pal.loop_border, bar_a_rl)
         g:draw_line(lx2, rl.y + 1, lx2, rl.y + rl.h, 1.5)
       end
     end
@@ -617,16 +628,16 @@ function Render.paint_layer_2(self, g)
     if roll.w > 0 and roll.h > 0 then
       local cx, cy, cw, ch = clip_rect(lx1, roll.y, lx2 - lx1, roll.h, roll.x, roll.y, roll.w, roll.h)
       if cx then
-        set_rgb(g, pal.loop_fill, enabled and 0.08 or 0.03)
+        set_rgb(g, pal.loop_fill, fill_a_roll)
         g:fill_rect(cx, cy, cw, ch)
       end
-      if lx1 >= roll.x and lx1 <= roll.x + roll.w then
-        set_rgb(g, pal.loop_border, enabled and 0.55 or 0.22)
+      if (not is_auto_loop) and lx1 >= roll.x and lx1 <= roll.x + roll.w then
+        set_rgb(g, pal.loop_border, edge_a_roll)
         g:draw_line(lx1, roll.y, lx1, roll.y + roll.h, 1.0)
       end
       if lx2 >= roll.x and lx2 <= roll.x + roll.w then
-        set_rgb(g, pal.loop_border, enabled and 0.55 or 0.22)
-        g:draw_line(lx2, roll.y, lx2, roll.y + roll.h, 1.0)
+        set_rgb(g, pal.loop_border, edge_a_roll)
+        g:draw_line(lx2, roll.y, lx2, roll.y + roll.h, is_auto_loop and 1.2 or 1.0)
       end
     end
   end
@@ -811,8 +822,11 @@ function Render.paint_layer_3(self, g)
 
   -- 2b. High-Contrast Active Edit Feedback (ghost originals, ruler span, alignment guides, active halos)
   local dmode = self.drag_mode
-  if (dmode == "move" or dmode == "resize" or dmode == "create") and self.drag_note then
-    local is_resizing = (dmode == "resize") or (dmode == "create" and (self.default_len_mode or 1) == 2)
+  local kd_hud = self.keys_down
+  local alt_held = kd_hud and (kd_hud["Alt_L"] or kd_hud["Alt_R"] or kd_hud["Alt"] or kd_hud["alt"])
+  if (dmode == "move" or dmode == "resize" or dmode == "create" or dmode == "stretch") and (self.drag_note or self.drag_snaps) then
+    local is_stretching = (dmode == "stretch")
+    local is_resizing = (dmode == "resize") or is_stretching or (dmode == "create" and (self.default_len_mode or 1) == 2)
     local snaps = self.drag_snaps
     local targets = {}
     if snaps and #snaps > 0 then
@@ -820,7 +834,7 @@ function Render.paint_layer_3(self, g)
         if snaps[i].note then targets[#targets + 1] = snaps[i].note end
       end
     end
-    if #targets == 0 then
+    if #targets == 0 and self.drag_note then
       targets[1] = self.drag_note
     end
 
@@ -846,17 +860,17 @@ function Render.paint_layer_3(self, g)
       end
     end
     if gx0 >= roll.x and gx0 <= roll.x + roll.w then
-      set_rgb(g, pal.marquee_border, 0.58)
-      g:draw_line(gx0, (rl.h > 0) and rl.y or roll.y, gx0, roll.y + roll.h, 1.0)
+      set_rgb(g, pal.marquee_border, is_stretching and 0.85 or 0.58)
+      g:draw_line(gx0, (rl.h > 0) and rl.y or roll.y, gx0, roll.y + roll.h, is_stretching and 1.3 or 1.0)
     end
     if is_resizing and gx1 >= roll.x and gx1 <= roll.x + roll.w then
-      set_rgb(g, pal.note_selected, 0.72)
-      g:draw_line(gx1, (rl.h > 0) and rl.y or roll.y, gx1, roll.y + roll.h, 1.1)
+      set_rgb(g, pal.note_selected, 0.78)
+      g:draw_line(gx1, (rl.h > 0) and rl.y or roll.y, gx1, roll.y + roll.h, 1.2)
     end
 
     -- Target pitch row & keyboard key highlight for primary dragged note
-    local pri = self.drag_note
-    if not is_resizing then
+    local pri = self.drag_note or targets[1]
+    if (not is_resizing) and pri then
       local py1 = Layout.pitch_to_py(self, layout, pri.pitch)
       local rcx, rcy, rcw, rch = clip_rect(roll.x, py1, roll.w, ppp, roll.x, roll.y, roll.w, roll.h)
       if rcx then
@@ -872,8 +886,8 @@ function Render.paint_layer_3(self, g)
       end
     end
 
-    -- Original position ghost outlines for moved/resized selection
-    if snaps and (dmode == "move" or dmode == "resize") then
+    -- Original position ghost outlines for moved/resized/stretched selection
+    if snaps and (dmode == "move" or dmode == "resize" or is_stretching) then
       for i = 1, #snaps do
         local s = snaps[i]
         local tn = s.note
@@ -915,34 +929,65 @@ function Render.paint_layer_3(self, g)
       end
     end
 
-    -- Inline floating edit callout beside primary dragged note
-    local pnx1 = Layout.beat_to_px(self, layout, pri.start_beat)
-    local pny1 = Layout.pitch_to_py(self, layout, pri.pitch)
-    local tag_str
-    if dmode == "move" and self.drag_orig_start and self.drag_orig_pitch then
-      local db = pri.start_beat - self.drag_orig_start
-      local dp = pri.pitch - self.drag_orig_pitch
-      local pfx = self.drag_is_dup and "DUP " or ""
-      if abs(db) > 1e-4 or dp ~= 0 then
-        local dp_str = (dp >= 0) and string.format("+%d", dp) or tostring(dp)
-        tag_str = string.format("%s%s  %+.2fb (%s st)", pfx, Model.pitch_name(pri.pitch), db, dp_str)
-      else
-        tag_str = string.format("%s%s  %.2fb  %d sel", pfx, Model.pitch_name(pri.pitch), pri.start_beat, #targets)
+    -- Inline floating edit callout beside primary dragged note (or stretch span)
+    if pri then
+      local pnx1 = Layout.beat_to_px(self, layout, pri.start_beat)
+      local pny1 = Layout.pitch_to_py(self, layout, pri.pitch)
+      local tag_str
+      if dmode == "move" and self.drag_orig_start and self.drag_orig_pitch then
+        local db = pri.start_beat - self.drag_orig_start
+        local dp = pri.pitch - self.drag_orig_pitch
+        local pfx = self.drag_is_dup and "DUP " or ""
+        if abs(db) > 1e-4 or dp ~= 0 then
+          local dp_str = (dp >= 0) and string.format("+%d", dp) or tostring(dp)
+          tag_str = string.format("%s%s  %+.2fb (%s st)", pfx, Model.pitch_name(pri.pitch), db, dp_str)
+        else
+          tag_str = string.format("%s%s  %.2fb  %d sel", pfx, Model.pitch_name(pri.pitch), pri.start_beat, #targets)
+        end
+      elseif is_stretching then
+        local free_tag = alt_held and " [FREE]" or ""
+        tag_str = string.format("Stretch x%.2f (%.2fb)%s", self.drag_stretch_scale or 1.0, max_b - min_b, free_tag)
+        pnx1 = min(roll.x + roll.w - 60, gx1 + 4)
+      elseif is_resizing then
+        local free_tag = alt_held and " [FREE]" or ""
+        tag_str = string.format("Len %.2fb (%d sel)%s", pri.length, #targets, free_tag)
       end
-    elseif is_resizing then
-      tag_str = string.format("Len %.2fb (%d sel)", pri.length, #targets)
+      if tag_str and pnx1 <= roll.x + roll.w - 40 then
+        local tw = min(168, max(78, #tag_str * 6.2 + 12))
+        local th = 16
+        local tx = max(roll.x + 4, min(roll.x + roll.w - tw - 4, pnx1))
+        local ty = (pny1 - th - 5 >= roll.y + 4) and (pny1 - th - 5) or min(roll.y + roll.h - th - 4, pny1 + ppp + 5)
+        set_rgb(g, pal.hud_bg, 0.94)
+        fill_rrect(g, tx, ty, tw, th, 3.5)
+        set_rgb(g, pal.marquee_border, 0.90)
+        stroke_rrect(g, tx, ty, tw, th, 3.5, 0.9)
+        set_rgb(g, pal.hud_fg, 1.0)
+        g:draw_text(tag_str, tx + tw * 0.5, ty + th * 0.5, tw - 6, 9.0, CENTER_ALIGN)
+      end
     end
-    if tag_str and pnx1 <= roll.x + roll.w - 40 then
-      local tw = min(140, max(74, #tag_str * 6.2 + 12))
-      local th = 16
-      local tx = max(roll.x + 4, min(roll.x + roll.w - tw - 4, pnx1))
-      local ty = (pny1 - th - 5 >= roll.y + 4) and (pny1 - th - 5) or min(roll.y + roll.h - th - 4, pny1 + ppp + 5)
-      set_rgb(g, pal.hud_bg, 0.94)
-      fill_rrect(g, tx, ty, tw, th, 3.5)
-      set_rgb(g, pal.marquee_border, 0.90)
-      stroke_rrect(g, tx, ty, tw, th, 3.5, 0.9)
-      set_rgb(g, pal.hud_fg, 1.0)
-      g:draw_text(tag_str, tx + tw * 0.5, ty + th * 0.5, tw - 6, 9.0, CENTER_ALIGN)
+  end
+
+  -- 2c. Multi-Selected Notes Right-Edge Time-Stretch Handle (<->)
+  if not dmode or dmode == "stretch" then
+    local sr = Layout.get_stretch_handle_rect(self, layout)
+    if sr then
+      local active_s = (dmode == "stretch") or (self.hover_region == "stretch_handle")
+      local mid_y = sr.y + sr.h * 0.5
+      set_rgb(g, active_s and pal.note_selected or pal.marquee_border, active_s and 0.90 or 0.58)
+      if sr.x > sr.x_right then
+        g:draw_line(sr.x_right, mid_y, sr.x, mid_y, 1.0)
+      end
+      g:draw_line(sr.x_right, max(roll.y, sr.y_top), sr.x_right, min(roll.y + roll.h, sr.y_bot), active_s and 1.4 or 0.9)
+      if active_s and sr.x_left >= roll.x and sr.x_left <= roll.x + roll.w then
+        set_rgb(g, pal.loop_border, 0.72)
+        g:draw_line(sr.x_left, roll.y, sr.x_left, roll.y + roll.h, 1.1)
+      end
+      set_rgb(g, active_s and pal.note_selected or pal.hud_bg, active_s and 0.96 or 0.90)
+      fill_rrect(g, sr.x, sr.y, sr.w, sr.h, 4.0)
+      set_rgb(g, active_s and { 255, 255, 255 } or pal.marquee_border, 0.94)
+      stroke_rrect(g, sr.x, sr.y, sr.w, sr.h, 4.0, active_s and 1.3 or 0.9)
+      local icon_fg = active_s and Theme.contrast_text(pal.note_selected) or pal.hud_fg
+      Icons.draw(g, "time_stretch", sr, icon_fg, 0.98, 12)
     end
   end
 
@@ -1012,6 +1057,9 @@ function Render.paint_layer_3(self, g)
       elseif self.hover_region == "hzoom" then
         tx = max(4, tr.x - tip_w - 5)
         ty = max(4, min(h - tip_h - 4, tr.y + (tr.h - tip_h) * 0.5))
+      elseif self.hover_region == "stretch_handle" then
+        tx = (tr.x + tr.w + tip_w + 8 <= w - 4) and (tr.x + tr.w + 6) or max(4, tr.x - tip_w - 6)
+        ty = max(4, min(h - tip_h - 4, tr.y - tip_h - 4))
       else
         tx = max(4, min(w - tip_w - 4, tr.x + tr.w * 0.5 - tip_w * 0.5))
         ty = layout.toolbar.y + layout.toolbar.h + 5
@@ -1042,13 +1090,22 @@ function Render.get_hover_tooltip(self, layout)
     local tr = b and layout.btns and layout.btns[b] or nil
     if not tr then return nil, nil end
     if b == "play" then
-      return (self.playing and "Pause Playback  [Space]" or "Play Sequence  [Space]"), tr
+      if self.playing then
+        return ((self.return_to_start ~= false) and "Stop & Return to Play Start  [Space]" or "Pause Playback  [Space]"), tr
+      end
+      return "Play Sequence  [Space]", tr
     elseif b == "stop" then
-      return "Stop & Rewind Playhead", tr
+      return "Stop & Rewind Playhead to 0.0", tr
     elseif b == "loop" then
-      return "Loop Region: " .. (self.loop_enabled and "ON" or "OFF") .. " (Ruler: Ctrl+Drag / DblClick)", tr
+      local has_l, ls, le, is_auto = Model.get_effective_loop(self)
+      if has_l then
+        return string.format("Loop: ON (%s%.1f-%.1fb) (Ruler: Ctrl+Drag / DblClick)", is_auto and "Auto " or "", ls, le), tr
+      end
+      return "Loop Region: OFF (Ruler: Ctrl+Drag / DblClick)", tr
     elseif b == "follow" then
       return "Follow Playhead: " .. ((self.follow_playhead ~= false) and "ON (Auto-Scroll)" or "OFF"), tr
+    elseif b == "ret_start" then
+      return "Space Return to Start: " .. ((self.return_to_start ~= false) and "ON (Return to Play Start)" or "OFF (Pause in Place)"), tr
     elseif b == "bpm_minus" then
       return "Decrease BPM (-1, Shift: -0.1)", tr
     elseif b == "bpm_val" then
@@ -1100,7 +1157,12 @@ function Render.get_hover_tooltip(self, layout)
     elseif b == "mod_shift" then
       return "Shift Lock: Drag Note=Duplicate / Blank=Zoom", tr
     elseif b == "mod_alt" then
-      return "Alt Lock: Drag Canvas=Free Pan / Alt Hotkeys", tr
+      return "Alt Lock: Pan Canvas / Bypass Snap on Tail & Stretch", tr
+    end
+  elseif region == "stretch_handle" then
+    local sr = Layout.get_stretch_handle_rect(self, layout)
+    if sr then
+      return "Stretch Selection Time: Drag L/R (Hold Alt = No Snap)", sr
     end
   elseif region == "corner_bl" then
     return "Reset Default Zoom & View Position", layout.corner_bl

@@ -72,10 +72,8 @@ function Playback.emit_pos(self)
 end
 
 function Playback.emit_loop(self)
-  local en = (self.loop_enabled and self.loop_start ~= nil and self.loop_end ~= nil) and 1 or 0
-  local ls = self.loop_start or 0
-  local le = self.loop_end or 0
-  self:outlet(3, "loop", { en, ls, le })
+  local has_loop, ls, le = Model.get_effective_loop(self)
+  self:outlet(3, "loop", { has_loop and 1 or 0, ls or 0, le or 0 })
 end
 
 function Playback.release_playback_voices(self)
@@ -319,13 +317,16 @@ function Playback.start(self)
   Playback.release_playback_voices(self)
 
   local ph = self.playhead_beat or 0.0
-  -- If playhead sits past loop_end while looping is enabled, snap to loop_start
-  if self.loop_enabled and self.loop_start and self.loop_end and self.loop_end > self.loop_start then
-    if ph >= self.loop_end or ph < 0 then
-      ph = self.loop_start
+  -- If playhead sits past effective loop_end while looping is enabled, snap to loop_start
+  local has_loop, ls, le = Model.get_effective_loop(self)
+  if has_loop and ls ~= nil and le ~= nil and le > ls then
+    if ph >= le or ph < 0 then
+      ph = ls
       self.playhead_beat = ph
     end
   end
+  -- Remember start beat so pressing Space can rewind back here when return_to_start is enabled
+  self.last_play_start_beat = ph
 
   local changed = activate_notes_spanning(self, ph)
   self.event_cursor = find_cursor_after(self.events, ph)
@@ -374,6 +375,33 @@ function Playback.pause(self)
   end
 end
 
+function Playback.toggle_space(self)
+  if self.playing then
+    if self.return_to_start ~= false then
+      self.playing = false
+      if self.tick_clock then self.tick_clock:unset() end
+      if self.redraw_clock then self.redraw_clock:unset() end
+
+      Playback.all_voices_off(self)
+      self.playhead_beat = max(0.0, self.last_play_start_beat or 0.0)
+
+      self:outlet(3, "playing", { 0 })
+      Playback.emit_pos(self)
+      Playback.emit_empty_list(self)
+      Playback.follow_view(self, true)
+
+      self._dirty_l1 = true
+      self._dirty_l2 = true
+      self._dirty_l3 = true
+      self:flush_repaint()
+    else
+      Playback.pause(self)
+    end
+  else
+    Playback.start(self)
+  end
+end
+
 function Playback.stop(self)
   self.playing = false
   if self.tick_clock then self.tick_clock:unset() end
@@ -381,15 +409,13 @@ function Playback.stop(self)
 
   Playback.all_voices_off(self)
 
-  if self.loop_enabled and self.loop_start ~= nil and self.loop_end ~= nil and self.loop_end > self.loop_start then
-    self.playhead_beat = self.loop_start
-  else
-    self.playhead_beat = 0.0
-  end
+  self.playhead_beat = 0.0
+  self.last_play_start_beat = 0.0
 
   self:outlet(3, "playing", { 0 })
   Playback.emit_pos(self)
   Playback.emit_empty_list(self)
+  Playback.follow_view(self, true)
 
   self._dirty_l1 = true
   self._dirty_l2 = true
@@ -451,26 +477,28 @@ function Playback.on_tick(self)
   local new_beat = old_beat + (dt_ms / 1000.0) * bps
 
   local list_changed = false
-  local has_loop = self.loop_enabled and self.loop_start ~= nil and self.loop_end ~= nil
-                   and (self.loop_end > self.loop_start)
+  local has_loop, ls, le = Model.get_effective_loop(self)
+  has_loop = has_loop and ls ~= nil and le ~= nil and (le > ls)
 
-  if has_loop and old_beat < self.loop_end and new_beat >= self.loop_end then
-    -- Process everything up to loop_end (including noteoffs at loop_end)
-    if process_events_until(self, self.loop_end, true) then
-      list_changed = true
+  if has_loop and new_beat >= le then
+    if old_beat < le then
+      -- Process everything up to loop_end (including noteoffs at loop_end)
+      if process_events_until(self, le, true) then
+        list_changed = true
+      end
     end
     if Playback.release_playback_voices(self) then
       list_changed = true
     end
 
-    local loop_len = self.loop_end - self.loop_start
-    local wrapped = self.loop_start + ((new_beat - self.loop_start) % loop_len)
-    self.playhead_beat = self.loop_start
-    if activate_notes_spanning(self, self.loop_start) then
+    local loop_len = le - ls
+    local wrapped = ls + ((new_beat - ls) % loop_len)
+    self.playhead_beat = ls
+    if activate_notes_spanning(self, ls) then
       list_changed = true
     end
-    self.event_cursor = find_cursor_after(self.events, self.loop_start)
-    if wrapped > self.loop_start then
+    self.event_cursor = find_cursor_after(self.events, ls)
+    if wrapped > ls then
       if process_events_until(self, wrapped, true) then
         list_changed = true
       end

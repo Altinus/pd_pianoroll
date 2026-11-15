@@ -163,6 +163,7 @@ function Input.action_undo(self)
     Model.rebuild_events(self)
     Playback.emit_active_list(self)
   end
+  if Model.is_auto_loop(self) then Playback.emit_loop(self) end
   self.hud_text = "Undo"
   self:outlet(4, "edited", { "undo" })
   self:save_state()
@@ -181,6 +182,7 @@ function Input.action_redo(self)
     Model.rebuild_events(self)
     Playback.emit_active_list(self)
   end
+  if Model.is_auto_loop(self) then Playback.emit_loop(self) end
   self.hud_text = "Redo"
   self:outlet(4, "edited", { "redo" })
   self:save_state()
@@ -209,6 +211,7 @@ function Input.action_cut(self)
   for i = 1, n do
     Playback.sync_note_removed(self, removed[i])
   end
+  if Model.is_auto_loop(self) then Playback.emit_loop(self) end
   self._ctrl_selected = false
   self._last_note_group_ids = nil
   self.hud_text = string.format("Cut %d note%s", n, (n > 1) and "s" or "")
@@ -226,6 +229,7 @@ function Input.action_paste(self, target_beat)
   for i = 1, n do
     Playback.sync_note_modified(self, pasted[i])
   end
+  if Model.is_auto_loop(self) then Playback.emit_loop(self) end
   self._ctrl_selected = (n > 1)
   self._last_note_group_ids = nil
   self.hud_text = string.format("Pasted %d @ %.2fb", n, pstart or 0.0)
@@ -244,6 +248,7 @@ function Input.action_duplicate(self)
   for i = 1, n do
     Playback.sync_note_modified(self, pasted[i])
   end
+  if Model.is_auto_loop(self) then Playback.emit_loop(self) end
   self._ctrl_selected = (n > 1)
   self._last_note_group_ids = nil
   self.hud_text = string.format("Duplicated %d @ %.2fb", n, pstart or 0.0)
@@ -253,6 +258,45 @@ function Input.action_duplicate(self)
   mark_all_dirty(self)
   self:flush_repaint()
   return n
+end
+
+function Input.action_octave_transpose(self, dir)
+  if Model.count_selected(self) == 0 then
+    self.hud_text = "Select notes for Ctrl+Up/Down"
+    self._dirty_l3 = true
+    self:flush_repaint()
+    return false
+  end
+  local pre = Model.capture_snapshot(self)
+  local ok, res, targets = Model.transpose_selected_octave(self, dir)
+  if not ok or not targets then
+    self.hud_text = tostring(res)
+    self._dirty_l3 = true
+    self:flush_repaint()
+    return false
+  end
+  Model.push_undo(self, pre)
+  local min_p, max_p = 127, 0
+  for i = 1, #targets do
+    local tn = targets[i]
+    Playback.sync_note_modified(self, tn)
+    if tn.pitch < min_p then min_p = tn.pitch end
+    if tn.pitch > max_p then max_p = tn.pitch end
+  end
+  local layout = Layout.compute(self)
+  local vis_p = layout.roll.h / (self.px_per_pitch or Layout.DEF_PPP)
+  local bot_p = (self.view_pitch_top or 82.0) - vis_p
+  if max_p > (self.view_pitch_top or 82.0) or min_p < bot_p then
+    local mid_p = (min_p + max_p) * 0.5
+    self.view_pitch_top = mid_p + vis_p * 0.5
+    Layout.clamp_view(self, layout)
+  end
+  self:outlet(4, "edited", { "transpose", res })
+  self:save_state()
+  self.hud_text = string.format("Octave %+d (%d note%s)", res, #targets, (#targets > 1) and "s" or "")
+  mark_all_dirty(self)
+  self:flush_repaint()
+  return true
 end
 
 -- ============================================================================
@@ -302,6 +346,7 @@ function Input.on_key_list(self, atoms)
           for i = 1, #removed do
             Playback.sync_note_removed(self, removed[i])
           end
+          if Model.is_auto_loop(self) then Playback.emit_loop(self) end
           self._ctrl_selected = false
           self:outlet(4, "edited", { "delete", #removed })
           self:save_state()
@@ -310,7 +355,11 @@ function Input.on_key_list(self, atoms)
         end
       end
     elseif key == "space" or key == "Space" then
-      if self.playing then Playback.pause(self) else Playback.start(self) end
+      Playback.toggle_space(self)
+    elseif mod_ctrl and (kl == "up" or kl == "arrowup" or kl == "kp_up") then
+      Input.action_octave_transpose(self, 1)
+    elseif mod_ctrl and (kl == "down" or kl == "arrowdown" or kl == "kp_down") then
+      Input.action_octave_transpose(self, -1)
     elseif key == "Escape" then
       Model.clear_selection(self)
       self._ctrl_selected = false
@@ -354,18 +403,21 @@ end
 local function handle_toolbar_down(self, layout, x, y)
   local btns = layout.btns
   if Layout.in_rect(x, y, btns.play) then
-    if self.playing then Playback.pause(self) else Playback.start(self) end
+    Playback.toggle_space(self)
     return true
   elseif Layout.in_rect(x, y, btns.stop) then
     Playback.stop(self)
     return true
   elseif Layout.in_rect(x, y, btns.loop) then
-    if self.loop_start == nil or self.loop_end == nil or self.loop_end <= self.loop_start then
-      self.loop_start = 0.0
-      self.loop_end   = max(1.0, min(self.length_beats or 16, (self.timesig_num or 4) * 1.0))
-    end
     self.loop_enabled = not self.loop_enabled
+    local has_l, ls, le, is_auto = Model.get_effective_loop(self)
+    if has_l then
+      self.hud_text = string.format("Loop: ON (%s%.1f-%.1fb)", is_auto and "Auto " or "", ls, le)
+    else
+      self.hud_text = "Loop: OFF"
+    end
     Playback.emit_loop(self)
+    self:save_state()
     mark_all_dirty(self)
     self:flush_repaint()
     return true
@@ -377,6 +429,14 @@ local function handle_toolbar_down(self, layout, x, y)
     self.hud_text = "Follow Playhead: " .. (self.follow_playhead and "ON" or "OFF")
     self:save_state()
     mark_all_dirty(self)
+    self:flush_repaint()
+    return true
+  elseif Layout.in_rect(x, y, btns.ret_start) then
+    self.return_to_start = (self.return_to_start == false)
+    self.hud_text = "Space Return to Start: " .. (self.return_to_start and "ON" or "OFF")
+    self:save_state()
+    self._dirty_l1 = true
+    self._dirty_l3 = true
     self:flush_repaint()
     return true
   elseif Layout.in_rect(x, y, btns.bpm_minus) then
@@ -644,14 +704,18 @@ function Input.mouse_down(self, x, y)
     if self._last_ruler_click_time
        and pd.timesince(self._last_ruler_click_time) < 350
        and abs(x - (self._last_ruler_click_x or -999)) < 7 then
-      -- Double-click on ruler -> remove loop setting
+      -- Double-click on ruler -> clear explicit custom loop range (returns to auto-loop if enabled)
       self._last_ruler_click_time = nil
-      self.loop_enabled = false
       self.loop_start = nil
       self.loop_end   = nil
       Playback.emit_loop(self)
       self.drag_mode = nil
-      self.hud_text  = "Loop Cleared"
+      if self.loop_enabled then
+        self.hud_text = string.format("Loop: Auto (0-%.1fb)", Model.get_auto_loop_end(self))
+      else
+        self.hud_text = "Loop Cleared"
+      end
+      self:save_state()
       mark_all_dirty(self)
       self:flush_repaint()
       return
@@ -688,8 +752,50 @@ function Input.mouse_down(self, x, y)
   local shift = is_shift(self)
   local alt   = is_alt(self)
 
-  -- Alt + drag anywhere in roll: Free 2D view pan
-  if alt then
+  -- Check multi-selected group time-stretch handle (<->) before hit-test / Alt-pan
+  local stretch_r = Layout.get_stretch_handle_rect(self, layout)
+  if stretch_r and Layout.in_rect(x, y, stretch_r) then
+    local sel_notes = Model.get_selected_notes(self)
+    local snaps = {}
+    for i = 1, #sel_notes do
+      local sn = sel_notes[i]
+      snaps[i] = {
+        note       = sn,
+        start_beat = sn.start_beat,
+        pitch      = sn.pitch,
+        length     = sn.length,
+      }
+    end
+    local sbeat = Layout.px_to_beat(self, layout, x)
+    self._last_note_click_time  = nil
+    self._last_note_group_ids   = nil
+    self._collapse_on_up_id     = nil
+    self._pending_undo_snap     = Model.capture_snapshot(self)
+    self.drag_mode              = "stretch"
+    self.drag_note              = sel_notes[1]
+    self.drag_snaps             = snaps
+    self.drag_start_x           = x
+    self.drag_start_y           = y
+    self.drag_stretch_anchor    = stretch_r.anchor_beat
+    self.drag_stretch_orig_end  = stretch_r.max_end_beat
+    self.drag_stretch_orig_span = max(0.03125, stretch_r.max_end_beat - stretch_r.anchor_beat)
+    self.drag_stretch_offset    = sbeat - stretch_r.max_end_beat
+    self.drag_stretch_scale     = 1.0
+    self.drag_moved             = false
+    self.hud_text = string.format("Stretch 1.00x (%.2f -> %.2fb)", stretch_r.anchor_beat, stretch_r.max_end_beat)
+    self._dirty_l2 = true
+    self._dirty_l3 = true
+    self:flush_repaint()
+    return
+  end
+
+  local hit, is_tail = Model.hit_test_px(self, layout, x, y)
+  local beat  = max(0.0, Layout.px_to_beat(self, layout, x))
+  local pitch = Layout.py_to_pitch(self, layout, y)
+
+  -- Alt + drag on canvas or note body -> Free 2D view pan;
+  -- EXCEPT Alt + drag on note tail edge -> Free unsnapped note-length resize!
+  if alt and not (hit and is_tail) then
     self.drag_mode = "pan"
     self.drag_start_x = x
     self.drag_start_y = y
@@ -701,124 +807,124 @@ function Input.mouse_down(self, x, y)
     return
   end
 
-  local hit, is_tail = Model.hit_test_px(self, layout, x, y)
-  local beat  = max(0.0, Layout.px_to_beat(self, layout, x))
-  local pitch = Layout.py_to_pitch(self, layout, y)
-
   if hit then
     -- Remember length of clicked note for "Last Note" length mode
     self.last_note_len = hit.length
 
-    -- Ctrl + click existing note -> toggle selection
-    if ctrl then
-      Model.toggle_select(self, hit.id)
-      self._ctrl_selected        = (Model.count_selected(self) >= 1)
-      self._last_note_click_time = nil
-      self._last_note_group_ids  = nil
-      self._dirty_l1 = true
-      self._dirty_l2 = true
-      self:flush_repaint()
-      return
-    end
-
-    -- Shift + click/drag existing note:
-    --   * When shift_drag_dup ON & on note body: Shift+Drag duplicates (FL-style); Shift+Click adds to selection
-    --   * When shift_drag_dup OFF or on tail: Shift+Click adds to selection
-    if shift then
-      if self.shift_drag_dup ~= false and not is_tail then
-        local prev_sel = {}
-        if self.selected_ids then
-          for k, v in pairs(self.selected_ids) do prev_sel[k] = v end
-        end
-        local hit_was_sel = Model.is_selected(self, hit.id)
-        local targets = hit_was_sel and Model.get_selected_notes(self) or { hit }
-        local snaps = {}
-        for i = 1, #targets do
-          local sn = targets[i]
-          snaps[i] = {
-            note       = sn,
-            start_beat = sn.start_beat,
-            pitch      = sn.pitch,
-            length     = sn.length,
-          }
-        end
-        self._shift_dup_armed   = true
-        self._shift_dup_done    = false
-        self._shift_prev_sel    = prev_sel
-        self._shift_hit_was_sel = hit_was_sel
-        self._collapse_on_up_id = nil
-        self._pending_undo_snap = Model.capture_snapshot(self)
-        self.drag_mode          = "move"
-        self.drag_is_dup        = false
-        self.drag_note          = hit
-        self.drag_snaps         = snaps
-        self.drag_start_x       = x
-        self.drag_start_y       = y
-        self.drag_mouse_beat    = beat
-        self.drag_mouse_pitch   = pitch
-        self.drag_orig_start    = hit.start_beat
-        self.drag_orig_pitch    = hit.pitch
-        self.drag_orig_len      = hit.length
-        self.drag_moved         = false
-        if self.preview_on_edit ~= false then
-          Playback.start_audition(self, hit.pitch, hit.velocity)
-        end
-        self.hud_text = string.format("Shift+Drag: Duplicate (%d)", #snaps)
-        self._dirty_l3 = true
+    -- Skip Ctrl/Shift/Double-click when Alt+tail-dragging so edge resize always enters cleanly
+    if not (alt and is_tail) then
+      -- Ctrl + click existing note -> toggle selection
+      if ctrl then
+        Model.toggle_select(self, hit.id)
+        self._ctrl_selected        = (Model.count_selected(self) >= 1)
+        self._last_note_click_time = nil
+        self._last_note_group_ids  = nil
+        self._dirty_l1 = true
+        self._dirty_l2 = true
         self:flush_repaint()
         return
       end
 
-      if not self.selected_ids then self.selected_ids = {} end
-      self.selected_ids[hit.id] = true
-      self.primary_sel_id = hit.id
-      self._ctrl_selected        = (Model.count_selected(self) > 1)
-      self._last_note_group_ids = nil
-      self._dirty_l1 = true
-      self._dirty_l2 = true
-      self:flush_repaint()
-      return
-    end
-
-    -- Double-click existing note -> delete note, OR delete ALL selected notes if part of multi-selection!
-    local now = pd.systime()
-    if self._last_note_click_time
-       and self._last_note_click_id == hit.id
-       and pd.timesince(self._last_note_click_time) < 350
-       and abs(x - (self._last_note_click_x or -999)) < 7
-       and abs(y - (self._last_note_click_y or -999)) < 7 then
-      self._last_note_click_time = nil
-      self._last_note_click_id   = nil
-      if self._last_note_group_ids and self._last_note_group_ids[hit.id] then
-        self.selected_ids = self._last_note_group_ids
-      end
-      self._last_note_group_ids = nil
-
-      Model.push_undo(self)
-      if Model.is_selected(self, hit.id) and Model.count_selected(self) > 1 then
-        local removed = Model.remove_selected(self)
-        for i = 1, #removed do
-          Playback.sync_note_removed(self, removed[i])
+      -- Shift + click/drag existing note:
+      --   * When shift_drag_dup ON & on note body: Shift+Drag duplicates (FL-style); Shift+Click adds to selection
+      --   * When shift_drag_dup OFF or on tail: Shift+Click adds to selection
+      if shift then
+        if self.shift_drag_dup ~= false and not is_tail then
+          local prev_sel = {}
+          if self.selected_ids then
+            for k, v in pairs(self.selected_ids) do prev_sel[k] = v end
+          end
+          local hit_was_sel = Model.is_selected(self, hit.id)
+          local targets = hit_was_sel and Model.get_selected_notes(self) or { hit }
+          local snaps = {}
+          for i = 1, #targets do
+            local sn = targets[i]
+            snaps[i] = {
+              note       = sn,
+              start_beat = sn.start_beat,
+              pitch      = sn.pitch,
+              length     = sn.length,
+            }
+          end
+          self._shift_dup_armed   = true
+          self._shift_dup_done    = false
+          self._shift_prev_sel    = prev_sel
+          self._shift_hit_was_sel = hit_was_sel
+          self._collapse_on_up_id = nil
+          self._pending_undo_snap = Model.capture_snapshot(self)
+          self.drag_mode          = "move"
+          self.drag_is_dup        = false
+          self.drag_note          = hit
+          self.drag_snaps         = snaps
+          self.drag_start_x       = x
+          self.drag_start_y       = y
+          self.drag_mouse_beat    = beat
+          self.drag_mouse_pitch   = pitch
+          self.drag_orig_start    = hit.start_beat
+          self.drag_orig_pitch    = hit.pitch
+          self.drag_orig_len      = hit.length
+          self.drag_moved         = false
+          if self.preview_on_edit ~= false then
+            Playback.start_audition(self, hit.pitch, hit.velocity)
+          end
+          self.hud_text = string.format("Shift+Drag: Duplicate (%d)", #snaps)
+          self._dirty_l3 = true
+          self:flush_repaint()
+          return
         end
-        self:outlet(4, "edited", { "delete", #removed })
-      else
-        Playback.sync_note_removed(self, hit)
-        Model.remove_note(self, hit)
-        self:outlet(4, "edited", { "delete", hit.pitch, hit.start_beat })
-      end
-      self.drag_mode = nil
-      self.hud_text  = nil
-      self:save_state()
-      mark_all_dirty(self)
-      self:flush_repaint()
-      return
-    end
 
-    self._last_note_click_time = now
-    self._last_note_click_id   = hit.id
-    self._last_note_click_x    = x
-    self._last_note_click_y    = y
-    self._last_note_group_ids  = nil
+        if not self.selected_ids then self.selected_ids = {} end
+        self.selected_ids[hit.id] = true
+        self.primary_sel_id = hit.id
+        self._ctrl_selected        = (Model.count_selected(self) > 1)
+        self._last_note_group_ids = nil
+        self._dirty_l1 = true
+        self._dirty_l2 = true
+        self:flush_repaint()
+        return
+      end
+
+      -- Double-click existing note -> delete note, OR delete ALL selected notes if part of multi-selection!
+      local now = pd.systime()
+      if self._last_note_click_time
+         and self._last_note_click_id == hit.id
+         and pd.timesince(self._last_note_click_time) < 350
+         and abs(x - (self._last_note_click_x or -999)) < 7
+         and abs(y - (self._last_note_click_y or -999)) < 7 then
+        self._last_note_click_time = nil
+        self._last_note_click_id   = nil
+        if self._last_note_group_ids and self._last_note_group_ids[hit.id] then
+          self.selected_ids = self._last_note_group_ids
+        end
+        self._last_note_group_ids = nil
+
+        Model.push_undo(self)
+        if Model.is_selected(self, hit.id) and Model.count_selected(self) > 1 then
+          local removed = Model.remove_selected(self)
+          for i = 1, #removed do
+            Playback.sync_note_removed(self, removed[i])
+          end
+          self:outlet(4, "edited", { "delete", #removed })
+        else
+          Playback.sync_note_removed(self, hit)
+          Model.remove_note(self, hit)
+          self:outlet(4, "edited", { "delete", hit.pitch, hit.start_beat })
+        end
+        if Model.is_auto_loop(self) then Playback.emit_loop(self) end
+        self.drag_mode = nil
+        self.hud_text  = nil
+        self:save_state()
+        mark_all_dirty(self)
+        self:flush_repaint()
+        return
+      end
+
+      self._last_note_click_time = now
+      self._last_note_click_id   = hit.id
+      self._last_note_click_x    = x
+      self._last_note_click_y    = y
+      self._last_note_group_ids  = nil
+    end
 
     -- Selection logic: if clicking an unselected note, select only it;
     -- if already part of multi-selection, preserve group for group drag
@@ -1250,8 +1356,9 @@ function Input.mouse_drag(self, x, y)
       self._last_note_click_time = nil
     end
     local snaps = self.drag_snaps or { { note = note, start_beat = self.drag_orig_start, pitch = self.drag_orig_pitch, length = self.drag_orig_len } }
-    local min_len = self.snap_enabled and Model.get_grid_step(self) or 0.0625
-    local end_beat = Model.snap_round(self, beat)
+    local free = is_alt(self) or (not self.snap_enabled)
+    local min_len = free and 0.03125 or Model.get_grid_step(self)
+    local end_beat = free and beat or Model.snap_round(self, beat)
     local target_len = max(min_len, end_beat - self.drag_orig_start)
     local d_len = target_len - self.drag_orig_len
 
@@ -1268,11 +1375,68 @@ function Input.mouse_drag(self, x, y)
       self.last_note_len = note.length
       Model.recompute_max_end(self)
       Playback.sync_note_modified(self, note)
-      self.hud_text = string.format("%s (%d)  Len %.2f", Model.pitch_name(note.pitch), note.pitch, note.length)
+      local tag = is_alt(self) and " [NO SNAP]" or ""
+      self.hud_text = string.format("%s (%d)  Len %.2f%s", Model.pitch_name(note.pitch), note.pitch, note.length, tag)
       self._dirty_l2 = true
       self._dirty_l3 = true
       self:flush_repaint()
     end
+
+  elseif mode == "stretch" then
+    local snaps = self.drag_snaps
+    if not snaps or #snaps == 0 then return end
+    local anchor = self.drag_stretch_anchor or 0.0
+    local orig_span = max(0.03125, self.drag_stretch_orig_span or 1.0)
+    local raw_end = Layout.px_to_beat(self, layout, x) - (self.drag_stretch_offset or 0.0)
+    local free = is_alt(self) or (not self.snap_enabled)
+    local target_end
+    if free then
+      target_end = max(anchor + 0.0625, raw_end)
+    else
+      local step = max(0.03125, Model.get_grid_step(self))
+      if (self.snap_mode or 1) == 2 then
+        local raw_span = max(step, raw_end - anchor)
+        local snapped_span = max(step, floor(raw_span / step + 0.5) * step)
+        target_end = anchor + snapped_span
+      else
+        local min_grid_end = max(step, ceil((anchor + 0.03125) / step - 1e-9) * step)
+        target_end = max(min_grid_end, Model.snap_round(self, raw_end))
+      end
+    end
+
+    local scale = max(0.03125, target_end - anchor) / orig_span
+    local changed = false
+    for i = 1, #snaps do
+      local s = snaps[i]
+      local sn = s.note
+      local ns = max(0.0, anchor + (s.start_beat - anchor) * scale)
+      local nl = max(0.03125, s.length * scale)
+      if abs(sn.start_beat - ns) > 1e-9 or abs(sn.length - nl) > 1e-9 then
+        sn.start_beat = ns
+        sn.length     = nl
+        changed = true
+      end
+    end
+
+    self.drag_stretch_scale = scale
+    if changed then
+      self.last_note_len = snaps[#snaps].note.length
+      Model.recompute_max_end(self)
+      if self.playing then
+        Model.rebuild_events(self)
+        for i = 1, #snaps do
+          Playback.sync_note_modified(self, snaps[i].note)
+        end
+      else
+        self.events_dirty = true
+      end
+    end
+    local tag = is_alt(self) and " [NO SNAP]" or ""
+    self.hud_text = string.format("Stretch %.2fx (%.2f -> %.2fb)%s",
+      scale, anchor, anchor + orig_span * scale, tag)
+    self._dirty_l2 = true
+    self._dirty_l3 = true
+    self:flush_repaint()
 
   elseif mode == "create" then
     if (self.default_len_mode or 1) == 2 then
@@ -1336,8 +1500,8 @@ function Input.mouse_up(self, x, y)
 
   if mode == "bpm_drag" then
     self:save_state()
-  elseif mode == "move" or mode == "resize" or mode == "create" then
-    if self.drag_note then
+  elseif mode == "move" or mode == "resize" or mode == "create" or mode == "stretch" then
+    if self.drag_note and mode ~= "stretch" then
       self.last_note_len = self.drag_note.length
     end
     if self._collapse_on_up_id and not self.drag_moved then
@@ -1367,8 +1531,19 @@ function Input.mouse_up(self, x, y)
           self._pending_undo_snap = nil
         end
         self:outlet(4, "edited", { "duplicate", self.drag_snaps and #self.drag_snaps or 1 })
+        if Model.is_auto_loop(self) then Playback.emit_loop(self) end
         self:save_state()
       end
+    elseif mode == "stretch" then
+      if self._pending_undo_snap then
+        if not Model.snapshots_equal(self._pending_undo_snap, Model.capture_snapshot(self)) then
+          Model.push_undo(self, self._pending_undo_snap)
+          self:outlet(4, "edited", { "stretch", self.drag_stretch_scale or 1.0 })
+        end
+        self._pending_undo_snap = nil
+      end
+      if Model.is_auto_loop(self) then Playback.emit_loop(self) end
+      self:save_state()
     elseif mode == "move" or mode == "resize" then
       if self._pending_undo_snap then
         if not Model.snapshots_equal(self._pending_undo_snap, Model.capture_snapshot(self)) then
@@ -1376,24 +1551,31 @@ function Input.mouse_up(self, x, y)
         end
         self._pending_undo_snap = nil
       end
+      if Model.is_auto_loop(self) then Playback.emit_loop(self) end
       self:outlet(4, "edited", { mode })
       self:save_state()
     elseif mode == "create" then
+      if Model.is_auto_loop(self) then Playback.emit_loop(self) end
       self:save_state()
     end
   end
 
-  self._pending_undo_snap  = nil
-  self._collapse_on_up_id  = nil
-  self._shift_dup_armed    = nil
-  self._shift_dup_done     = nil
-  self._shift_prev_sel     = nil
-  self._shift_hit_was_sel  = nil
-  self.drag_is_dup         = nil
-  self.drag_orig_pan_extra = nil
-  self.drag_scroll_per_px  = nil
-  self.drag_scroll_min     = nil
-  self.drag_scroll_max     = nil
+  self._pending_undo_snap     = nil
+  self._collapse_on_up_id     = nil
+  self._shift_dup_armed       = nil
+  self._shift_dup_done        = nil
+  self._shift_prev_sel        = nil
+  self._shift_hit_was_sel     = nil
+  self.drag_is_dup            = nil
+  self.drag_orig_pan_extra    = nil
+  self.drag_scroll_per_px     = nil
+  self.drag_scroll_min        = nil
+  self.drag_scroll_max        = nil
+  self.drag_stretch_anchor    = nil
+  self.drag_stretch_orig_end  = nil
+  self.drag_stretch_orig_span = nil
+  self.drag_stretch_offset    = nil
+  self.drag_stretch_scale     = nil
   self.drag_mode   = nil
   self.drag_note   = nil
   self.drag_snaps  = nil
@@ -1453,11 +1635,16 @@ function Input.mouse_move(self, x, y)
     new_region = "keyboard"
     new_pitch  = Layout.py_to_pitch(self, layout, y)
   elseif Layout.in_rect(x, y, layout.roll) then
-    local hit, is_tail = Model.hit_test_px(self, layout, x, y)
-    if hit then
-      new_region  = "note"
-      new_note_id = hit.id
-      new_tail    = is_tail
+    local stretch_r = Layout.get_stretch_handle_rect(self, layout)
+    if stretch_r and Layout.in_rect(x, y, stretch_r) then
+      new_region = "stretch_handle"
+    else
+      local hit, is_tail = Model.hit_test_px(self, layout, x, y)
+      if hit then
+        new_region  = "note"
+        new_note_id = hit.id
+        new_tail    = is_tail
+      end
     end
   end
 

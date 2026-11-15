@@ -145,6 +145,8 @@ function M:save_state()
     (self.shift_drag_dup ~= false) and 1 or 0,
     -5, -- v5 extension header sentinel (preserves v1..v4 patch loading)
     (self.follow_playhead ~= false) and 1 or 0,
+    -6, -- v6 extension header sentinel (preserves v1..v5 patch loading)
+    (self.return_to_start ~= false) and 1 or 0,
   }
 
   local note_atoms = Model.serialize_notes(self)
@@ -206,7 +208,7 @@ function M:initialize(sel, atoms)
   self.preview_on_edit  = true
   self.preview_to_out1  = false
 
-  self.loop_enabled     = false
+  self.loop_enabled     = true
   self.loop_start       = nil
   self.loop_end         = nil
 
@@ -243,6 +245,7 @@ function M:initialize(sel, atoms)
 
   self.playing          = false
   self.playhead_beat    = 0.0
+  self.last_play_start_beat = 0.0
   self.playhead_sec     = 0.0
   self.last_systime     = pd.systime()
 
@@ -269,6 +272,7 @@ function M:initialize(sel, atoms)
   self.show_tooltips      = true
   self.shift_drag_dup     = true
   self.follow_playhead    = true
+  self.return_to_start    = true
   self._mouse_inside      = false
   self._pan_extra_beats   = 0.0
   self.undo_stack         = {}
@@ -344,6 +348,10 @@ function M:initialize(sel, atoms)
         if n_atoms >= note_start + 1 and num_or(atoms[note_start], 0) == -5 then
           self.follow_playhead = (num_or(atoms[note_start + 1], 1) ~= 0)
           note_start = note_start + 2
+          if n_atoms >= note_start + 1 and num_or(atoms[note_start], 0) == -6 then
+            self.return_to_start = (num_or(atoms[note_start + 1], 1) ~= 0)
+            note_start = note_start + 2
+          end
         end
       end
     end
@@ -467,6 +475,8 @@ function M:prereload()
     show_tooltips = self.show_tooltips,
     shift_drag_dup = self.shift_drag_dup,
     follow_playhead = self.follow_playhead,
+    return_to_start = self.return_to_start,
+    last_play_start_beat = self.last_play_start_beat,
     _pan_extra_beats = self._pan_extra_beats,
     undo_stack = self.undo_stack,
     redo_stack = self.redo_stack,
@@ -663,7 +673,7 @@ end
 
 function M:in_1(sel, atoms)
   if sel == "bang" then
-    if self.playing then Playback.pause(self) else Playback.start(self) end
+    Playback.toggle_space(self)
     return
   elseif sel == "float" then
     Playback.seek_beat(self, atoms[1] or 0)
@@ -678,11 +688,14 @@ function M:in_1(sel, atoms)
   elseif sel == "pause" then
     Playback.pause(self)
     return
+  elseif sel == "space" then
+    Playback.toggle_space(self)
+    return
   elseif sel == "stop" then
     Playback.stop(self)
     return
   elseif sel == "toggle" then
-    if self.playing then Playback.pause(self) else Playback.start(self) end
+    Playback.toggle_space(self)
     return
   elseif sel == "reset" or sel == "rewind" then
     Playback.seek_beat(self, 0.0)
@@ -754,8 +767,12 @@ function M:in_1(sel, atoms)
     return
   elseif sel == "timesig" then
     self.timesig_num = clamp(floor(num_or(atoms[1], 4) + 0.5), 1, 16)
+    if Model.is_auto_loop(self) then
+      Playback.emit_loop(self)
+    end
     self:save_state()
     self._dirty_l1 = true
+    self._dirty_l2 = true
     self:flush_repaint()
     return
   elseif sel == "vel" or sel == "velocity" then
@@ -766,17 +783,8 @@ function M:in_1(sel, atoms)
     local n = #atoms
     if n == 0 then
       self.loop_enabled = not self.loop_enabled
-      if self.loop_enabled and (not self.loop_start or not self.loop_end or self.loop_end <= self.loop_start) then
-        self.loop_start = 0.0
-        self.loop_end   = max(1.0, min(self.length_beats or 16, self.timesig_num or 4))
-      end
     elseif n == 1 then
-      local en = bool_from_atom(atoms[1], false)
-      self.loop_enabled = en
-      if en and (not self.loop_start or not self.loop_end or self.loop_end <= self.loop_start) then
-        self.loop_start = 0.0
-        self.loop_end   = max(1.0, min(self.length_beats or 16, self.timesig_num or 4))
-      end
+      self.loop_enabled = bool_from_atom(atoms[1], false)
     elseif n == 2 then
       local a = max(0.0, num_or(atoms[1], 0.0))
       local b = max(a + 0.0625, num_or(atoms[2], a + 4.0))
@@ -799,7 +807,6 @@ function M:in_1(sel, atoms)
     self:flush_repaint()
     return
   elseif sel == "clear_loop" or sel == "loop_clear" then
-    self.loop_enabled = false
     self.loop_start   = nil
     self.loop_end     = nil
     Playback.emit_loop(self)
@@ -819,6 +826,9 @@ function M:in_1(sel, atoms)
       local note = Model.add_note(self, p, s, l, v)
       Model.push_undo(self, pre)
       Playback.sync_note_modified(self, note)
+      if Model.is_auto_loop(self) then
+        Playback.emit_loop(self)
+      end
       self:outlet(4, "edited", { "add", note.pitch, note.start_beat, note.length, note.velocity })
       self:save_state()
       Layout.clamp_view(self)
@@ -857,6 +867,9 @@ function M:in_1(sel, atoms)
     if self.playing then
       Playback.seek_beat(self, self.playhead_beat or 0.0)
     end
+    if Model.is_auto_loop(self) then
+      Playback.emit_loop(self)
+    end
     self:outlet(4, "edited", { "set_notes", #self.notes })
     self:save_state()
     Layout.clamp_view(self)
@@ -873,6 +886,9 @@ function M:in_1(sel, atoms)
         Model.push_undo(self)
         Model.remove_note(self, note)
         Playback.sync_note_removed(self, note)
+        if Model.is_auto_loop(self) then
+          Playback.emit_loop(self)
+        end
         self:outlet(4, "edited", { "delete", note.id })
         self:save_state()
         self._dirty_l1 = true
@@ -890,6 +906,9 @@ function M:in_1(sel, atoms)
           Model.push_undo(self)
           Model.remove_note(self, n)
           Playback.sync_note_removed(self, n)
+          if Model.is_auto_loop(self) then
+            Playback.emit_loop(self)
+          end
           self:outlet(4, "edited", { "delete", n.id })
           self:save_state()
           self._dirty_l1 = true
@@ -910,6 +929,9 @@ function M:in_1(sel, atoms)
         for i = 1, #removed do
           Playback.sync_note_removed(self, removed[i])
         end
+        if Model.is_auto_loop(self) then
+          Playback.emit_loop(self)
+        end
         self:outlet(4, "edited", { "delete", #removed })
         self:save_state()
         self._dirty_l1 = true
@@ -929,6 +951,10 @@ function M:in_1(sel, atoms)
     end
     Midi.clear_tracks(self)
     Model.clear_notes(self)
+    self.last_play_start_beat = 0.0
+    if Model.is_auto_loop(self) then
+      Playback.emit_loop(self)
+    end
     self:outlet(4, "edited", { "clear" })
     self:save_state()
     Layout.clamp_view(self)
@@ -960,6 +986,9 @@ function M:in_1(sel, atoms)
       Model.push_undo(self, pre)
       if self.playing then
         Playback.seek_beat(self, self.playhead_beat or 0.0)
+      end
+      if Model.is_auto_loop(self) then
+        Playback.emit_loop(self)
       end
       self:outlet(4, "edited", { "quantize", str })
       self:save_state()
@@ -1008,6 +1037,12 @@ function M:in_1(sel, atoms)
     if self.follow_playhead and self.playing then
       Playback.follow_view(self, true)
     end
+    self:save_state()
+    self._dirty_l3 = true
+    self:flush_repaint()
+    return
+  elseif sel == "return_start" or sel == "return_to_start" then
+    self.return_to_start = bool_from_atom(atoms[1], true)
     self:save_state()
     self._dirty_l3 = true
     self:flush_repaint()
@@ -1284,6 +1319,7 @@ function M:properties(p)
   p:add_check("Auto Rewind",    "prop_auto_rewind",  self.auto_rewind and 1 or 0)
   p:add_check("Loop Enabled",   "prop_loop_enabled", self.loop_enabled and 1 or 0)
   p:add_check("Follow Playhead", "prop_follow_playhead", (self.follow_playhead ~= false) and 1 or 0)
+  p:add_check("Space Return to Start", "prop_return_to_start", (self.return_to_start ~= false) and 1 or 0)
 
   p:new_frame("MIDI & Editing", 2)
   p:add_combo("Default Length",   "prop_def_len_mode", self.default_len_mode or 1, Model.DEF_LEN_MODES)
@@ -1405,12 +1441,7 @@ function M:prop_auto_rewind(v)
 end
 
 function M:prop_loop_enabled(v)
-  local en = bool_from_atom(v, false)
-  self.loop_enabled = en
-  if en and (not self.loop_start or not self.loop_end or self.loop_end <= self.loop_start) then
-    self.loop_start = 0.0
-    self.loop_end   = max(1.0, min(self.length_beats or 16, self.timesig_num or 4))
-  end
+  self.loop_enabled = bool_from_atom(v, false)
   Playback.emit_loop(self)
   refresh_all(self)
 end
@@ -1557,6 +1588,13 @@ function M:prop_follow_playhead(v)
   if self.follow_playhead and self.playing then
     Playback.follow_view(self, true)
   end
+  self:save_state()
+  self._dirty_l3 = true
+  self:flush_repaint()
+end
+
+function M:prop_return_to_start(v)
+  self.return_to_start = bool_from_atom(v, true)
   self:save_state()
   self._dirty_l3 = true
   self:flush_repaint()

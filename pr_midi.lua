@@ -887,6 +887,7 @@ function Midi.switch_track(self, target)
     #self.notes,
     active_trk and (active_trk.name or "") or "all",
   })
+  Playback.emit_loop(self)
   self:save_state()
   self._dirty_l1 = true
   self._dirty_l2 = true
@@ -1007,7 +1008,13 @@ function Midi.import_from_file(self, raw_path, track_opt)
                                   trk_info, #self.notes, self.bpm or 120.0)
   end
 
+  -- Clear stale custom loop bounds so Auto-Loop adapts to the shortest bar covering imported MIDI
+  self.loop_start = nil
+  self.loop_end   = nil
+  Playback.emit_loop(self)
+
   self.playhead_beat = 0.0
+  self.last_play_start_beat = 0.0
   Playback.emit_pos(self)
   if self.playing then
     Playback.seek_beat(self, 0.0)

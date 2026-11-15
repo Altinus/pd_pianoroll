@@ -382,6 +382,64 @@ function Model.transpose_selected(self, semitones)
   return true
 end
 
+--- Transpose ONLY explicitly selected notes by +/- semitones while preserving chord intervals in [0, 127].
+function Model.transpose_selected_octave(self, delta)
+  local targets = Model.get_selected_notes(self)
+  if #targets == 0 then
+    return false, "Select notes first"
+  end
+  local st = (delta >= 0) and 12 or -12
+  local min_p, max_p = 127, 0
+  for i = 1, #targets do
+    local p = targets[i].pitch
+    if p < min_p then min_p = p end
+    if p > max_p then max_p = p end
+  end
+  if st > 0 and max_p + st > 127 then
+    return false, "Octave +12: upper MIDI limit (127)"
+  end
+  if st < 0 and min_p + st < 0 then
+    return false, "Octave -12: lower MIDI limit (0)"
+  end
+  for i = 1, #targets do
+    targets[i].pitch = targets[i].pitch + st
+  end
+  self.events_dirty = true
+  return true, st, targets
+end
+
+--- Compute the shortest bar-aligned loop end beat covering all MIDI notes (minimum 1 bar).
+function Model.get_auto_loop_end(self)
+  local tsig = max(1, self.timesig_num or 4)
+  local max_end = self.max_end_beat or 0.0
+  if (not self.notes or #self.notes == 0) or max_end <= 1e-6 then
+    return tsig * 1.0
+  end
+  local bars = max(1, ceil(max(0.0, max_end - 1e-5) / tsig))
+  return bars * tsig
+end
+
+--- Return (has_custom_range) indicating whether an explicit user loop range is set.
+function Model.has_custom_loop(self)
+  return self.loop_start ~= nil and self.loop_end ~= nil and self.loop_end > self.loop_start
+end
+
+--- Return true when loop is enabled and using automatic shortest-bar coverage (no custom range).
+function Model.is_auto_loop(self)
+  return (self.loop_enabled == true) and (not Model.has_custom_loop(self))
+end
+
+--- Return (is_active, loop_start, loop_end, is_auto) for transport & rendering.
+function Model.get_effective_loop(self)
+  if not self.loop_enabled then
+    return false, nil, nil, false
+  end
+  if Model.has_custom_loop(self) then
+    return true, self.loop_start, self.loop_end, false
+  end
+  return true, 0.0, Model.get_auto_loop_end(self), true
+end
+
 function Model.quantize_notes(self, strength)
   strength = max(0.0, min(1.0, tonumber(strength) or 1.0))
   local step = Model.get_grid_step(self)

@@ -118,6 +118,7 @@ function Layout.compute(self, w, h)
     add_btn("stop", 20)
     add_btn("loop", 22)
     add_btn("follow", 22)
+    add_btn("ret_start", 22)
     cx = cx + 2
     if add_btn("bpm", 62) then
       local r = btns.bpm
@@ -271,6 +272,64 @@ function Layout.py_to_pitch(self, layout, py)
   if p < 0 then return 0 end
   if p > 127 then return 127 end
   return p
+end
+
+--- Compute the clickable right-side time-stretch handle rectangle for multi-selected notes (>= 2).
+function Layout.get_stretch_handle_rect(self, layout)
+  local sel = self.selected_ids
+  local notes = self.notes
+  if not sel or not notes or #notes < 2 then return nil end
+
+  layout = layout or Layout.compute(self)
+  local roll = layout.roll
+  if not roll or roll.w < 30 or roll.h < 20 then return nil end
+
+  local count = 0
+  local min_s, max_e = 1e12, -1e12
+  local min_p, max_p = 128, -1
+  for i = 1, #notes do
+    local n = notes[i]
+    if sel[n.id] then
+      count = count + 1
+      if n.start_beat < min_s then min_s = n.start_beat end
+      local eb = n.start_beat + n.length
+      if eb > max_e then max_e = eb end
+      if n.pitch < min_p then min_p = n.pitch end
+      if n.pitch > max_p then max_p = n.pitch end
+    end
+  end
+  if count < 2 or max_e <= min_s then return nil end
+
+  local x_left  = Layout.beat_to_px(self, layout, min_s)
+  local x_right = Layout.beat_to_px(self, layout, max_e)
+  local y_top   = Layout.pitch_to_py(self, layout, max_p)
+  local y_bot   = Layout.pitch_to_py(self, layout, min_p) + (self.px_per_pitch or Layout.DEF_PPP)
+
+  if y_bot < roll.y or y_top > roll.y + roll.h then return nil end
+  if x_right < roll.x - 2 or x_right > roll.x + roll.w + 8 then return nil end
+
+  local hw, hh = 20, 16
+  local hx = floor(x_right + 6 + 0.5)
+  if hx + hw > roll.x + roll.w - 2 then
+    hx = max(roll.x + 2, floor(roll.x + roll.w - hw - 2))
+  end
+
+  local vis_y0 = max(roll.y, y_top)
+  local vis_y1 = min(roll.y + roll.h, y_bot)
+  local cy = (vis_y0 + vis_y1) * 0.5
+  local hy = floor(cy - hh * 0.5 + 0.5)
+  hy = max(roll.y + 2, min(roll.y + roll.h - hh - 2, hy))
+
+  return {
+    x = hx, y = hy, w = hw, h = hh,
+    count = count,
+    anchor_beat = min_s,
+    max_end_beat = max_e,
+    x_left = x_left,
+    x_right = x_right,
+    y_top = y_top,
+    y_bot = y_bot,
+  }
 end
 
 return Layout

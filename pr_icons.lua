@@ -177,6 +177,22 @@ local function build_body(name, c, a)
       '<path d="M2.0,7.8 H7.2 M5.4,5.7 L7.6,7.8 L5.4,9.9" fill="none" stroke="%s" stroke-opacity="%s" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>',
       c, a, c, a, c, a
     )
+  elseif name == "ret_start" then
+    -- Return-to-start anchor line with left return arrow
+    return string.format(
+      '<line x1="2.8" y1="2.6" x2="2.8" y2="11.4" stroke="%s" stroke-opacity="%s" stroke-width="1.5" stroke-linecap="round"/>' ..
+      '<path d="M11.2,4.4 V7.4 H5.4" fill="none" stroke="%s" stroke-opacity="%s" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round"/>' ..
+      '<path d="M6.8,5.1 L3.9,7.4 L6.8,9.7 Z" fill="%s" fill-opacity="%s"/>',
+      c, a, c, a, c, a
+    )
+  elseif name == "time_stretch" then
+    -- Horizontal left/right double arrow for group time-stretch handle
+    return string.format(
+      '<path d="M4.2,7.0 H9.8" fill="none" stroke="%s" stroke-opacity="%s" stroke-width="1.5" stroke-linecap="round"/>' ..
+      '<path d="M5.2,4.1 L1.8,7.0 L5.2,9.9 Z" fill="%s" fill-opacity="%s"/>' ..
+      '<path d="M8.8,4.1 L12.2,7.0 L8.8,9.9 Z" fill="%s" fill-opacity="%s"/>',
+      c, a, c, a, c, a
+    )
   elseif name == "reset" then
     -- Circular view reset arrow around center anchor dot
     return string.format(
