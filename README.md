@@ -2,7 +2,9 @@
 
 A modular, vector-rendered DAW piano roll GUI object for **plugdata** / **Pure Data** (`pdlua` + `LuaJIT 2.1` + NanoVG), featuring a 3-layer cached renderer, vector SVG toolbar icons with toggleable hover tooltips, FL-style Shift+Drag duplication, group time-stretch handle, polyphonic voice/list scheduling, dynamic shortest-bar Auto-Loop, and zero-dependency Standard MIDI File (`.mid` Type 0/1) import & export. Licensed under the [MIT License](./LICENSE).
 
-![pianoroll preview](./preview.svg)
+![pianoroll preview](./assets/preview_main.png)
+
+![pianoroll detail preview](./assets/preview_detail.png)
 
 ---
 
