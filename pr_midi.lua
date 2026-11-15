@@ -87,20 +87,71 @@ local function is_abs_path(p)
   return false
 end
 
-function Midi.resolve_path(self, raw_path)
+local function join_base(base, p)
+  if type(base) ~= "string" or base == "" then return p end
+  local clean_b = base:gsub("[/\\]+$", "")
+  if clean_b == "" then
+    return sub(base, 1, 1) .. p
+  end
+  return clean_b .. "/" .. p
+end
+
+local function file_exists(path)
+  if type(path) ~= "string" or path == "" then return false end
+  local lib = k32
+  if win32_ready and lib then
+    local wpath = utf8_to_wide(path)
+    if wpath then
+      local h = lib.CreateFileW(wpath, 0x80000000, 1, nil, 3, 0x80, nil)
+      if h ~= nil and h ~= INVALID_HANDLE then
+        lib.CloseHandle(h)
+        return true
+      end
+    end
+  end
+  local f = io.open(path, "rb")
+  if f then
+    f:close()
+    return true
+  end
+  return false
+end
+
+--- Resolve a possibly relative MIDI path against patch folder, object folder, or pd._loadpath.
+function Midi.resolve_path(self, raw_path, for_read)
   local p = Midi.strip_quotes(raw_path)
   if p == "" then return "" end
   if is_abs_path(p) then return p end
 
-  local base = (self and type(self._canvaspath) == "string" and self._canvaspath ~= "" and self._canvaspath)
-            or (self and type(self._loadpath) == "string" and self._loadpath ~= "" and self._loadpath)
-            or (pd and type(rawget(pd, "_loadpath")) == "string" and rawget(pd, "_loadpath"))
-  if base and base ~= "" then
-    local last = sub(base, -1)
-    if last ~= "/" and last ~= "\\" then
-      base = base .. "/"
+  local bases = {}
+  local seen  = {}
+  local function push_base(b)
+    if type(b) == "string" and b ~= "" then
+      local key = b:gsub("[/\\]+$", "")
+      if not seen[key] then
+        seen[key] = true
+        bases[#bases + 1] = b
+      end
     end
-    return base .. p
+  end
+  push_base(self and self._canvaspath)
+  push_base(self and self._loadpath)
+  push_base(pd and rawget(pd, "_loadpath"))
+
+  if for_read then
+    for i = 1, #bases do
+      local cand = join_base(bases[i], p)
+      if file_exists(cand) then
+        return cand
+      end
+    end
+    if file_exists(p) then
+      return p
+    end
+  end
+
+  if bases[1] then
+    return join_base(bases[1], p)
   end
   return p
 end
@@ -928,7 +979,7 @@ local function compute_synced_length(max_end_beat, tsig_num)
 end
 
 function Midi.import_from_file(self, raw_path, track_opt)
-  local path = Midi.resolve_path(self, raw_path)
+  local path = Midi.resolve_path(self, raw_path, true)
   if path == "" then
     return false, "import_midi: missing file path"
   end

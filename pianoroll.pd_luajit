@@ -82,7 +82,7 @@ local function parse_color_arg(c, g, b, fallback)
   if type(c) == "number" then
     return Theme.clamp_rgb({ c, tonumber(g) or c, tonumber(b) or c }, fallback)
   end
-  return Theme.clamp_rgb(fallback, { 78, 201, 176 })
+  return Theme.clamp_rgb(fallback, { 94, 133, 159 })
 end
 
 -- ============================================================================
@@ -137,7 +137,7 @@ function M:save_state()
     self.redraw_ms or 33,
     -2, -- v2 extension header sentinel (preserves v1 51-atom patch loading)
     self.grid_color[1], self.grid_color[2], self.grid_color[3],
-    self.grid_contrast or 1.0,
+    self.grid_contrast or 0.5,
     -3, -- v3 extension header sentinel (preserves v1 & v2 patch loading)
     (self.single_key_hotkeys ~= false) and 1 or 0,
     -4, -- v4 extension header sentinel (preserves v1, v2 & v3 patch loading)
@@ -223,13 +223,13 @@ function M:initialize(sel, atoms)
   self.scroll_size      = 16
 
   self.theme_mode       = 1      -- 1=Auto(Plugdata), 2=Dark, 3=Light, 4=Custom
-  self.note_color       = { 78, 201, 176 }
-  self.selected_color   = { 255, 198, 92 }
-  self.playhead_color   = { 255, 92, 92 }
-  self.loop_color       = { 96, 175, 255 }
+  self.note_color       = { 94, 133, 159 }
+  self.selected_color   = { 189, 79, 81 }
+  self.playhead_color   = { 192, 89, 107 }
+  self.loop_color       = { 138, 139, 140 }
   self.grid_color       = { 96, 102, 114 }
-  self.grid_contrast    = 1.0
-  self.custom_bg_color  = { 34, 36, 42 }
+  self.grid_contrast    = 0.5
+  self.custom_bg_color  = { 25, 27, 31 }
 
   self.show_toolbar     = true
   self.show_ruler       = true
@@ -335,7 +335,7 @@ function M:initialize(sel, atoms)
     local note_start = HDR_LEN + 1
     if n_atoms >= HDR_LEN + 5 and num_or(atoms[HDR_LEN + 1], 0) == -2 then
       self.grid_color    = Theme.clamp_rgb({ atoms[HDR_LEN + 2], atoms[HDR_LEN + 3], atoms[HDR_LEN + 4] }, self.grid_color)
-      self.grid_contrast = clamp(num_or(atoms[HDR_LEN + 5], 1.0), 0.25, 2.0)
+      self.grid_contrast = clamp(num_or(atoms[HDR_LEN + 5], 0.5), 0.25, 2.0)
       note_start = HDR_LEN + 6
       if n_atoms >= note_start + 1 and num_or(atoms[note_start], 0) == -3 then
         self.single_key_hotkeys = (num_or(atoms[note_start + 1], 1) ~= 0)
@@ -1119,7 +1119,7 @@ function M:in_1(sel, atoms)
     self:flush_repaint()
     return
   elseif sel == "grid_contrast" then
-    self.grid_contrast = clamp(num_or(atoms[1], 1.0), 0.25, 2.0)
+    self.grid_contrast = clamp(num_or(atoms[1], 0.5), 0.25, 2.0)
     self:save_state()
     self._dirty_l1 = true
     self:flush_repaint()
@@ -1333,7 +1333,7 @@ function M:properties(p)
 
   p:new_frame("Appearance & Colors", 2)
   p:add_combo("Theme Mode",       "prop_theme_mode",      self.theme_mode or 1, { "Auto (Plugdata)", "Dark Studio", "Light Studio", "Custom" })
-  p:add_float("Grid Contrast",    "prop_grid_contrast",   self.grid_contrast or 1.0, 0.25, 2.0)
+  p:add_float("Grid Contrast",    "prop_grid_contrast",   self.grid_contrast or 0.5, 0.25, 2.0)
   p:add_color("Note Color",       "prop_note_color",      self.note_color)
   p:add_color("Selected Color",   "prop_selected_color",  self.selected_color)
   p:add_color("Playhead Color",   "prop_playhead_color",  self.playhead_color)
@@ -1509,7 +1509,7 @@ function M:prop_grid_color(c, g, b)
 end
 
 function M:prop_grid_contrast(v)
-  self.grid_contrast = clamp(num_or(v, 1.0), 0.25, 2.0)
+  self.grid_contrast = clamp(num_or(v, 0.5), 0.25, 2.0)
   refresh_all(self)
 end
 

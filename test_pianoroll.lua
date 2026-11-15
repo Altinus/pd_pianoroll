@@ -71,9 +71,25 @@ local function send_msg(inlet, sel, ...)
   harness.send(inlet, sel, atoms)
 end
 
--- Verify fresh instance starts in Loop mode (auto shortest-bar loop until custom set)
+-- Verify fresh instance starts in Loop mode, Space Return-to-Start ON & patch-matched palette
 assert(obj.loop_enabled == true, "fresh instance defaults to Loop Enabled ON")
 assert(obj.return_to_start == true, "fresh instance defaults to Space Return-to-Start ON")
+harness.assert_eq(obj.note_color[1], 94, "default note_color R == 94")
+harness.assert_eq(obj.note_color[2], 133, "default note_color G == 133")
+harness.assert_eq(obj.note_color[3], 159, "default note_color B == 159")
+harness.assert_eq(obj.selected_color[1], 189, "default selected_color R == 189")
+harness.assert_eq(obj.selected_color[2], 79, "default selected_color G == 79")
+harness.assert_eq(obj.selected_color[3], 81, "default selected_color B == 81")
+harness.assert_eq(obj.playhead_color[1], 192, "default playhead_color R == 192")
+harness.assert_eq(obj.playhead_color[2], 89, "default playhead_color G == 89")
+harness.assert_eq(obj.playhead_color[3], 107, "default playhead_color B == 107")
+harness.assert_eq(obj.loop_color[1], 138, "default loop_color R == 138")
+harness.assert_eq(obj.loop_color[2], 139, "default loop_color G == 139")
+harness.assert_eq(obj.loop_color[3], 140, "default loop_color B == 140")
+harness.assert_eq(obj.custom_bg_color[1], 25, "default custom_bg_color R == 25")
+harness.assert_eq(obj.custom_bg_color[2], 27, "default custom_bg_color G == 27")
+harness.assert_eq(obj.custom_bg_color[3], 31, "default custom_bg_color B == 31")
+harness.assert_near(obj.grid_contrast, 0.5, 0.001, "default grid_contrast == 0.5")
 
 -- ----------------------------------------------------------------------------
 -- Test 1: Blank click create, drag move, tail drag resize, double-click delete
@@ -715,9 +731,9 @@ local pal_custom = Theme.resolve(obj)
 harness.assert_eq(pal_custom.grid_color[1], 70, "prop_grid_color updated palette red")
 harness.assert_eq(pal_custom.grid_color[3], 130, "prop_grid_color updated palette blue")
 assert(pal_custom.grid_bar_a > 0.9, "higher grid_contrast deepened bar line alpha")
--- Reset default grid color & contrast before final preview
+-- Reset default grid color & contrast before continuing
 obj:prop_grid_color({ 96, 102, 114 })
-obj:prop_grid_contrast(1.0)
+obj:prop_grid_contrast(0.5)
 
 -- Restore clean 720x380 view & test new features (Alt-Pan, Copy/Cut/Paste/Dup, Undo/Redo, Overlays)
 -- ----------------------------------------------------------------------------
@@ -1069,6 +1085,9 @@ obj:prop_show_tooltips(1)
 obj:prop_shift_drag_dup(1)
 obj:prop_follow_playhead(1)
 obj:prop_return_to_start(1)
+obj:prop_note_color({ 94, 133, 159 })
+obj:prop_grid_color({ 96, 102, 114 })
+obj:prop_grid_contrast(0.5)
 
 -- ----------------------------------------------------------------------------
 -- Test 21: Follow Playhead auto-scroll, loop wrap snap & toolbar/inlet toggles
@@ -1427,6 +1446,35 @@ end)()
   drag(x_tail3, yn, Layout.beat_to_px(obj, lay25, 3.12), yn, 4)
   harness.assert_near(obj.notes[1].length, 2.0, 0.02, "normal tail resize snapped cleanly to beat 3.0")
 
+  -- Hold Alt before clicking note body -> enters unsnapped move mode, NOT canvas pan
+  local x_body0 = Layout.beat_to_px(obj, lay25, 1.50)
+  send_msg(4, "list", 1, "Alt_L")
+  obj:mouse_down(x_body0, yn)
+  harness.assert_eq(obj.drag_mode, "move", "Alt+mouse_down on note body entered move mode (not pan)")
+  local dx_free1 = Layout.beat_to_px(obj, lay25, 1.87)
+  obj:mouse_drag(dx_free1, yn)
+  obj:mouse_up(dx_free1, yn)
+  send_msg(4, "list", 0, "Alt_L")
+  harness.assert_near(obj.notes[1].start_beat, 1.37, 0.03, "Alt+drag note body moved note freely without snap")
+  harness.assert_near(obj.view_beat, vb0, 0.001, "Alt+drag note body did not pan view")
+
+  -- Press Alt mid-move after starting a snapped move -> dynamically disables snap
+  local x_body1 = Layout.beat_to_px(obj, lay25, 1.87)
+  obj:mouse_down(x_body1, yn)
+  harness.assert_eq(obj.drag_mode, "move", "normal body mouse_down entered move")
+  obj:mouse_drag(Layout.beat_to_px(obj, lay25, 2.00), yn)
+  send_msg(4, "list", 1, "Alt_L")
+  local dx_free2 = Layout.beat_to_px(obj, lay25, 2.23)
+  obj:mouse_drag(dx_free2, yn)
+  obj:mouse_up(dx_free2, yn)
+  send_msg(4, "list", 0, "Alt_L")
+  harness.assert_near(obj.notes[1].start_beat, 1.73, 0.03, "pressing Alt mid-move disabled grid snap")
+
+  -- Normal body drag without Alt snaps cleanly back to grid
+  local x_body2 = Layout.beat_to_px(obj, lay25, 2.23)
+  drag(x_body2, yn, Layout.beat_to_px(obj, lay25, 2.55), yn, 4)
+  harness.assert_near(obj.notes[1].start_beat, 2.0, 0.02, "normal move without Alt snapped cleanly to grid beat 2.0")
+
   -- Alt + blank space still pans normally
   local y_blank = Layout.pitch_to_py(obj, lay25, 65) + obj.px_per_pitch * 0.5
   send_msg(4, "list", 1, "Alt_L")
@@ -1608,6 +1656,54 @@ end)()
          "import_midi cleared stale custom loop back to dynamic Auto-Loop")
   harness.assert_near(Model.get_auto_loop_end(obj), 8.0, 0.001,
                       "imported 6-beat MIDI auto-loops cleanly at 2 bars (8.0)")
+end)()
+
+-- Test 29: Starter MIDI Library (monophonic & multi-track polyphonic styles)
+;(function()
+  local starter_specs = {
+    { file = "midi/01_bach_minuet_in_g_poly.mid",    notes = 91,  bpm = 112, ts = 3, loop_end = 48.0, tracks = 2, mono = false },
+    { file = "midi/02_bach_cello_prelude_mono.mid", notes = 64,  bpm = 78,  ts = 4, loop_end = 16.0, tracks = 1, mono = true  },
+    { file = "midi/03_beethoven_fur_elise_poly.mid",notes = 53,  bpm = 128, ts = 3, loop_end = 27.0, tracks = 2, mono = false },
+    { file = "midi/04_satie_gymnopedie_no1_poly.mid",notes = 42, bpm = 76,  ts = 3, loop_end = 24.0, tracks = 2, mono = false },
+    { file = "midi/05_grieg_mountain_king_mono.mid",notes = 52,  bpm = 132, ts = 4, loop_end = 32.0, tracks = 1, mono = true  },
+  }
+
+  for _, spec in ipairs(starter_specs) do
+    send_msg(1, "import_midi", spec.file)
+    assert(#obj.notes == spec.notes,
+           string.format("%s note count expected %d got %d", spec.file, spec.notes, #obj.notes))
+    harness.assert_near(obj.bpm, spec.bpm, 0.05, spec.file .. " BPM synced")
+    assert(obj.timesig_num == spec.ts,
+           string.format("%s timesig_num expected %d got %d", spec.file, spec.ts, obj.timesig_num))
+    assert(obj.loop_enabled == true and Model.has_custom_loop(obj) == false,
+           spec.file .. " defaults to dynamic Auto-Loop")
+    harness.assert_near(Model.get_auto_loop_end(obj), spec.loop_end, 0.001,
+                        spec.file .. " Auto-Loop end matches shortest whole bar")
+    if spec.tracks > 1 then
+      assert(obj.midi_tracks and #obj.midi_tracks == spec.tracks,
+             string.format("%s track count expected %d got %s",
+                           spec.file, spec.tracks, tostring(obj.midi_tracks and #obj.midi_tracks)))
+      assert(obj.midi_track_idx == 0, spec.file .. " defaults to All Tracks (0)")
+      send_msg(1, "midi_track", "next")
+      assert(obj.midi_track_idx == 1 and #obj.notes > 0 and #obj.notes < spec.notes,
+             spec.file .. " switches cleanly to Track 1 solo")
+      send_msg(1, "midi_track", "all")
+      assert(obj.midi_track_idx == 0 and #obj.notes == spec.notes,
+             spec.file .. " restores All Tracks cleanly")
+    else
+      assert(obj.midi_tracks == nil, spec.file .. " leaves midi_tracks nil on single-track MIDI")
+    end
+
+    if spec.mono then
+      for i = 1, #obj.notes - 1 do
+        local a = obj.notes[i]
+        local b = obj.notes[i + 1]
+        assert(a.start_beat + a.length <= b.start_beat + 1e-5,
+               string.format("%s is strictly monophonic at idx %d (%.4f > %.4f)",
+                             spec.file, i, a.start_beat + a.length, b.start_beat))
+      end
+    end
+  end
 end)()
 
 ;(function()

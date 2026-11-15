@@ -938,11 +938,12 @@ function Render.paint_layer_3(self, g)
         local db = pri.start_beat - self.drag_orig_start
         local dp = pri.pitch - self.drag_orig_pitch
         local pfx = self.drag_is_dup and "DUP " or ""
+        local free_tag = alt_held and " [FREE]" or ""
         if abs(db) > 1e-4 or dp ~= 0 then
           local dp_str = (dp >= 0) and string.format("+%d", dp) or tostring(dp)
-          tag_str = string.format("%s%s  %+.2fb (%s st)", pfx, Model.pitch_name(pri.pitch), db, dp_str)
+          tag_str = string.format("%s%s  %+.2fb (%s st)%s", pfx, Model.pitch_name(pri.pitch), db, dp_str, free_tag)
         else
-          tag_str = string.format("%s%s  %.2fb  %d sel", pfx, Model.pitch_name(pri.pitch), pri.start_beat, #targets)
+          tag_str = string.format("%s%s  %.2fb  %d sel%s", pfx, Model.pitch_name(pri.pitch), pri.start_beat, #targets, free_tag)
         end
       elseif is_stretching then
         local free_tag = alt_held and " [FREE]" or ""
@@ -1157,7 +1158,7 @@ function Render.get_hover_tooltip(self, layout)
     elseif b == "mod_shift" then
       return "Shift Lock: Drag Note=Duplicate / Blank=Zoom", tr
     elseif b == "mod_alt" then
-      return "Alt Lock: Pan Canvas / Bypass Snap on Tail & Stretch", tr
+      return "Alt Lock: Blank=Pan / Drag Note, Tail & Stretch=No Snap", tr
     end
   elseif region == "stretch_handle" then
     local sr = Layout.get_stretch_handle_rect(self, layout)

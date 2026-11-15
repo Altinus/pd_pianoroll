@@ -793,9 +793,9 @@ function Input.mouse_down(self, x, y)
   local beat  = max(0.0, Layout.px_to_beat(self, layout, x))
   local pitch = Layout.py_to_pitch(self, layout, y)
 
-  -- Alt + drag on canvas or note body -> Free 2D view pan;
-  -- EXCEPT Alt + drag on note tail edge -> Free unsnapped note-length resize!
-  if alt and not (hit and is_tail) then
+  -- Alt + drag on blank canvas -> Free 2D view pan;
+  -- Alt + click/drag on note body or tail edge -> Free unsnapped note move / length resize!
+  if alt and not hit then
     self.drag_mode = "pan"
     self.drag_start_x = x
     self.drag_start_y = y
@@ -811,8 +811,8 @@ function Input.mouse_down(self, x, y)
     -- Remember length of clicked note for "Last Note" length mode
     self.last_note_len = hit.length
 
-    -- Skip Ctrl/Shift/Double-click when Alt+tail-dragging so edge resize always enters cleanly
-    if not (alt and is_tail) then
+    -- Skip Ctrl/Shift/Double-click when Alt-dragging a note so unsnapped move/resize enters cleanly
+    if not alt then
       -- Ctrl + click existing note -> toggle selection
       if ctrl then
         Model.toggle_select(self, hit.id)
@@ -968,7 +968,9 @@ function Input.mouse_down(self, x, y)
     if self.preview_on_edit ~= false then
       Playback.start_audition(self, hit.pitch, hit.velocity)
     end
-    self.hud_text = string.format("%s (%d)  %.2fb  Len %.2f", Model.pitch_name(hit.pitch), hit.pitch, hit.start_beat, hit.length)
+    self.hud_text = string.format("%s (%d)  %.2fb  Len %.2f%s",
+                                  Model.pitch_name(hit.pitch), hit.pitch, hit.start_beat, hit.length,
+                                  alt and " [NO SNAP]" or "")
     self._dirty_l1 = true
     self._dirty_l2 = true
     self._dirty_l3 = true
@@ -1305,7 +1307,10 @@ function Input.mouse_drag(self, x, y)
     local snaps = self.drag_snaps or { { note = note, start_beat = self.drag_orig_start, pitch = self.drag_orig_pitch, length = self.drag_orig_len } }
     local raw_db = beat - self.drag_mouse_beat
     local db
-    if (self.snap_mode or 1) == 2 then
+    if is_alt(self) or (not self.snap_enabled) then
+      -- Alt+drag (or Snap OFF): free continuous horizontal movement without grid snap
+      db = raw_db
+    elseif (self.snap_mode or 1) == 2 then
       -- Relative snap: preserve initial micro-timing offset
       db = Model.snap_delta(self, raw_db)
     else
@@ -1344,7 +1349,8 @@ function Input.mouse_drag(self, x, y)
         Playback.start_audition(self, note.pitch, note.velocity)
       end
       local prefix = self.drag_is_dup and "DUP " or ""
-      self.hud_text = string.format("%s%s (%d)  %.2fb", prefix, Model.pitch_name(note.pitch), note.pitch, note.start_beat)
+      local tag = is_alt(self) and " [NO SNAP]" or ""
+      self.hud_text = string.format("%s%s (%d)  %.2fb%s", prefix, Model.pitch_name(note.pitch), note.pitch, note.start_beat, tag)
       if just_cloned then self._dirty_l1 = true end
       self._dirty_l2 = true
       self._dirty_l3 = true
@@ -1439,18 +1445,20 @@ function Input.mouse_drag(self, x, y)
     self:flush_repaint()
 
   elseif mode == "create" then
+    local free = is_alt(self) or (not self.snap_enabled)
     if (self.default_len_mode or 1) == 2 then
       -- GRD mode: dragging while creating adjusts note length
       if abs(x - self.drag_start_x) >= 3 then
-        local min_len = self.snap_enabled and Model.get_grid_step(self) or 0.0625
-        local end_beat = Model.snap_round(self, beat)
+        local min_len = free and 0.03125 or Model.get_grid_step(self)
+        local end_beat = free and beat or Model.snap_round(self, beat)
         local new_len = max(min_len, end_beat - note.start_beat)
         if new_len ~= note.length then
           note.length = new_len
           self.last_note_len = new_len
           Model.recompute_max_end(self)
           Playback.sync_note_modified(self, note)
-          self.hud_text = string.format("%s (%d)  %.2fb  Len %.2f", Model.pitch_name(note.pitch), note.pitch, note.start_beat, note.length)
+          local tag = is_alt(self) and " [NO SNAP]" or ""
+          self.hud_text = string.format("%s (%d)  %.2fb  Len %.2f%s", Model.pitch_name(note.pitch), note.pitch, note.start_beat, note.length, tag)
           self._dirty_l2 = true
           self._dirty_l3 = true
           self:flush_repaint()
@@ -1460,7 +1468,9 @@ function Input.mouse_drag(self, x, y)
       -- LST mode (default) / preset length modes: dragging while creating moves note position cleanly
       local raw_db = beat - self.drag_mouse_beat
       local db
-      if (self.snap_mode or 1) == 2 then
+      if free then
+        db = raw_db
+      elseif (self.snap_mode or 1) == 2 then
         db = Model.snap_delta(self, raw_db)
       else
         local target_start = Model.snap_round(self, self.drag_orig_start + raw_db)
@@ -1478,7 +1488,8 @@ function Input.mouse_drag(self, x, y)
         if np ~= old_pitch and self.preview_on_edit ~= false then
           Playback.start_audition(self, note.pitch, note.velocity)
         end
-        self.hud_text = string.format("%s (%d)  %.2fb  Len %.2f", Model.pitch_name(note.pitch), note.pitch, note.start_beat, note.length)
+        local tag = is_alt(self) and " [NO SNAP]" or ""
+        self.hud_text = string.format("%s (%d)  %.2fb  Len %.2f%s", Model.pitch_name(note.pitch), note.pitch, note.start_beat, note.length, tag)
         self._dirty_l2 = true
         self._dirty_l3 = true
         self:flush_repaint()

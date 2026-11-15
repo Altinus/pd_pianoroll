@@ -60,12 +60,12 @@ local function read_host_colors()
 
   local bg  = has_host_bg and normalize_rgb(raw_bg, 35, 37, 42) or { 35, 37, 42 }
   local fg  = has_host_fg and normalize_rgb(raw_fg, 224, 227, 232) or { 224, 227, 232 }
-  local sel = normalize_rgb(raw_sel, 78, 201, 176)
+  local sel = normalize_rgb(raw_sel, 94, 133, 159)
   return bg, fg, sel
 end
 
 function Theme.clamp_rgb(c, fallback)
-  local fb = fallback or { 78, 201, 176 }
+  local fb = fallback or { 94, 133, 159 }
   return normalize_rgb(c, fb[1], fb[2], fb[3])
 end
 
@@ -86,13 +86,13 @@ function Theme.resolve(self)
   local mode = self.theme_mode or 1
 
   -- Check cache key so we don't rebuild palette every frame unless colors/mode changed
-  local nc = normalize_rgb(self.note_color, 78, 201, 176)
-  local sc = normalize_rgb(self.selected_color, 255, 198, 92)
-  local pc = normalize_rgb(self.playhead_color, 255, 92, 92)
-  local lc = normalize_rgb(self.loop_color, 96, 175, 255)
+  local nc = normalize_rgb(self.note_color, 94, 133, 159)
+  local sc = normalize_rgb(self.selected_color, 189, 79, 81)
+  local pc = normalize_rgb(self.playhead_color, 192, 89, 107)
+  local lc = normalize_rgb(self.loop_color, 138, 139, 140)
   local gc = normalize_rgb(self.grid_color, 96, 102, 114)
-  local g_con = max(0.25, min(2.0, tonumber(self.grid_contrast) or 1.0))
-  local cb = normalize_rgb(self.custom_bg_color, 34, 36, 42)
+  local g_con = max(0.25, min(2.0, tonumber(self.grid_contrast) or 0.5))
+  local cb = normalize_rgb(self.custom_bg_color, 25, 27, 31)
 
   local sig = string.format(
     "%d:%d,%d,%d:%d,%d,%d:%d,%d,%d:%d,%d,%d:%d,%d,%d:%d,%d,%d:%d,%d,%d:%.3f:%d,%d,%d",
