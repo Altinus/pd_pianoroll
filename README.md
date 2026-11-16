@@ -30,8 +30,6 @@ A modular, vector-rendered DAW piano roll GUI object for **plugdata** / **Pure D
   - Pure-Lua SMF Type 0 / Type 1 parser & encoder (with optional Windows UTF-8 `ffi` `kernel32` file I/O + `io.open` fallback — zero external C binaries to compile, `openpanel` / `savepanel` friendly).
   - Imports sync BPM, time signature numerator, sequence length, and reset stale custom loops back to Auto-Loop covering the imported piece. Multi-track Type 1 files expose an interactive track switcher pill (`ALL`, `T1`, `T2`, ...) and `midi_track` messages. Relative paths resolve against the patch folder and automatically fall back to the `[pianoroll]` object directory (so `midi/*.mid` loads from any patch).
   - Includes **5 ready-to-play public-domain MIDI scores** spanning Baroque, Classical, Impressionist, and Romantic Orchestral styles (both monophonic and multi-track polyphonic).
-- **Theme Engine & Persistence** (`pr_theme.lua`)
-  - Supports **Auto Host Colors**, **Dark**, **Light**, and **Custom** themes, tuned by default to match the release patch palette (`pianoroll_main.pd`). All state (notes, tempo, colors, zoom, view toggles) serializes directly into `.pd` patch arguments.
 
 ---
 
@@ -65,21 +63,6 @@ A modular, vector-rendered DAW piano roll GUI object for **plugdata** / **Pure D
 | [test_pianoroll.lua](./test_pianoroll.lua) | Offline 29-test regression suite executed via `pdlua-run.py` (protocol, DAW interactions, resize invariance, MIDI SMF roundtrip, starter scores). |
 | [midi/](./midi) | 5 curated starter `.mid` scores (monophonic & 2-track polyphonic across multiple styles). |
 | [LICENSE](./LICENSE) | MIT License text. |
-
----
-
-## Default Palette & Appearance
-
-Default colors match the pre-configured theme in [pianoroll_main.pd](./pianoroll_main.pd):
-
-| Parameter | Default RGB / Value | Role |
-| --- | --- | --- |
-| `note_color` | `94, 133, 159` | Steel blue note body & active transport accent |
-| `selected_color` | `189, 79, 81` | Warm crimson highlight for selected notes & handles |
-| `playhead_color` | `192, 89, 107` | Rose-red playback cursor line |
-| `loop_color` | `138, 139, 140` | Neutral slate loop span banner & range lines |
-| `grid_color` | `96, 102, 114` | Slate grid lines (`grid_contrast = 0.5`) |
-| `custom_bg_color` | `25, 27, 31` | Deep charcoal roll canvas (used with `Theme = Custom`) |
 
 ---
 
@@ -182,7 +165,6 @@ Example messages to Inlet 1 (relative paths resolve automatically from the patch
   - **Notes & Editing**: `add` / `note <pitch> <start> [len] [vel]`, `set_notes <p s l v ...>`, `remove <id|pitch start [eps]>`, `delete_selected`, `clear`, `transpose <semitones>`, `quantize [strength]`, `select_all`, `deselect`, `undo`, `redo`, `copy`, `cut`, `paste [beat]`, `duplicate` / `dup`
   - **UI & Input Toggles**: `tooltips` / `show_tooltips <0|1>`, `hotkeys` / `single_key_hotkeys <0|1>`, `shift_dup` / `shift_drag_dup <0|1>`
   - **Query & View**: `get_notes` / `dump`, `get_active`, `get_state`, `resize <w h>`, `fit`, `reset_view`
-  - **Appearance**: `theme <1..4|auto|dark|light|custom>`, `grid_contrast <0.25..2.0>`, `note_color <r g b>`, `selected_color <r g b>`, `playhead_color <r g b>`, `loop_color <r g b>`, `grid_color <r g b>`, `custom_bg_color <r g b>`
   - **MIDI & Keys**: `import_midi` / `load_midi <path> [track]`, `export_midi` / `save_midi <path>`, `midi_track` / `track <0|all|next|prev|N>`, `key <pressed> <keyname>`, `reset_keys`
 - **Inlet 2 — BPM Control**: `float <bpm>`, `bpm <bpm>`, `tempo <bpm>`, or `bang` (emits current `bpm` on Outlet 3)
 - **Inlet 3 — View, Scroll & Zoom Control**: `float <beat>` / `goto <beat>`, `scroll <beat> [pitch_top]` / `view <beat> [pitch_top]`, `zoom <ppb>` / `hzoom <ppb>`, `vzoom <ppp>`, `goto_pitch <pitch>`, `fit`
@@ -202,7 +184,6 @@ Example messages to Inlet 1 (relative paths resolve automatically from the patch
 Right-click `[pianoroll]` -> **Properties** in plugdata to inspect or override:
 - **Canvas Geometry & Timing**: `Width`, `Height`, `BPM`, `Time Sig Num`, `Length (beats)`, `Grid Division (1..9)`, `Snap Mode (1..4)`, `Default Length (1..5)`, `Default Velocity`
 - **Behavior Toggles**: `Snap Enabled`, `Loop Enabled`, `Audition on Edit`, `Follow Playhead`, `Space Return to Start`, `Shift+Drag Duplicate`, `Show Hover Tooltips`, `Single-Key Hover Hotkeys`
-- **Theme & Colors**: `Theme (Auto/Dark/Light/Custom)`, `Grid Contrast (0.25-2.0)`, `Note Color`, `Selected Color`, `Playhead Color`, `Loop Color`, `Grid Color`, `Custom Bg Color`
 
 ---
 
@@ -225,7 +206,7 @@ python F:\MyWork\0_Global\Knowledge\pdluajit\vscode-pdlua\harness\pdlua-run.py r
 
 This project was designed, directed, interactive-tested in **plugdata**, and curated by **Altinus**, with substantial assistance from **AI / Large Language Model (LLM) coding agents**:
 
-- **Human Author Responsibilities**: Product requirements, DAW workflow specification (navigation/snap UX, Shift+Drag duplicate, Alt unsnapped editing, Space return-to-start, Auto-Loop rules, multi-track MIDI workflow), default color theme curation, real-time plugdata audio/patch testing ([pianoroll_main.pd](./pianoroll_main.pd)), and starter score selection.
+- **Human Author Responsibilities**: Product requirements, DAW workflow specification (navigation/snap UX, Shift+Drag duplicate, Alt unsnapped editing, Space return-to-start, Auto-Loop rules, multi-track MIDI workflow), real-time plugdata audio/patch testing ([pianoroll_main.pd](./pianoroll_main.pd)), and starter score selection.
 - **AI / LLM Assisted Responsibilities**: Multi-module Lua/NanoVG architecture decomposition (`pr_*.lua`), vector SVG icon geometry, LuaJIT SMF `.mid` Type 0/1 binary codec implementation, offline harness regression test generation ([test_pianoroll.lua](./test_pianoroll.lua)), and documentation drafting ([README.md](./README.md)).
 - All AI-generated code and tests were reviewed, linted via `pdlua-run.py`, and iteratively verified by the author in plugdata before release.
 
